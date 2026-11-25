@@ -292,7 +292,6 @@ export const Toolbar: React.FC = () => {
         </Suspense>
       )}
       {phone ? <MobileEditorHeader
-        onAI={() => useUIStore.getState().setPanelVisible("agentChat", true)}
         onExport={() => { if (exportState.isExporting) handleCancelExport(); else { if (exportState.error) resetError(); openExportDialog(); } }}
         exportLabel={exportState.isExporting ? `${Math.round(exportState.progress)}%` : exportState.error ? "Retry" : exportState.complete ? "Saved" : "Export"}
         exportDisabled={exportState.complete}

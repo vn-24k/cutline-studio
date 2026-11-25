@@ -8,7 +8,7 @@ import { WorkspaceSaveStatus } from "../WorkspaceSaveStatus";
 import { MobileEditorIcon } from "./MobileEditorIcon";
 
 export function MobileEditorHeader({onAI, onExport, menu, exportControl, exportLabel = "Export", exportDisabled = false}: {
-  onAI: () => void; onExport: () => void; menu: ReactNode; exportControl?: ReactNode; exportLabel?: string; exportDisabled?: boolean;
+  onAI?: () => void; onExport: () => void; menu: ReactNode; exportControl?: ReactNode; exportLabel?: string; exportDisabled?: boolean;
 }) {
   const project = useProjectStore(state => state.project);
   const [leaving, setLeaving] = useState(false);
@@ -26,7 +26,7 @@ export function MobileEditorHeader({onAI, onExport, menu, exportControl, exportL
     <div className="mobile-editor-title">
       <ProjectSwitcher menuContent={menu} trigger={<Button variant="ghost" aria-label="Project menu" className="mobile-editor-title-button"><strong>{project.name}</strong><span>{Math.min(project.settings.width, project.settings.height)}p · {project.settings.frameRate} fps · <WorkspaceSaveStatus/></span></Button>}/>
     </div>
-    <Button className="mobile-editor-ai" aria-label="AI assist" onClick={onAI}><MobileEditorIcon name="sparkle" size={15}/>AI</Button>
+    {onAI && <Button className="mobile-editor-ai" aria-label="AI assist" onClick={onAI}><MobileEditorIcon name="sparkle" size={15}/>AI</Button>}
     {exportControl ?? <Button className="mobile-editor-export" disabled={exportDisabled} onClick={onExport}>{exportLabel}</Button>}
   </div>;
 }
