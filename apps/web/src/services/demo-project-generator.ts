@@ -297,6 +297,6 @@ export async function createDemoStudioProject(options?: {
     .getState()
     .project.timeline.tracks.find((t) => t.type === "video")?.clips[0]?.id;
   if (firstClipId) {
-    useUIStore.getState().selectItems([{ id: firstClipId, type: "clip" }]);
+    useUIStore.getState().select({ id: firstClipId, type: "clip" });
   }
 }
