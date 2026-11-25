@@ -2,7 +2,6 @@ import { useLatch } from "./use-latch";
 import { usePhoneEditor } from "../../hooks/usePhoneEditor";
 import { MobileEditorHeader } from "./mobile/MobileEditorHeader";
 import "./mobile/mobile-editor.css";
-import { useAIConnectionStore } from "../../stores/ai-connection-store";
 import { useEditorWorkspaceStore } from "../../stores/editor-workspace-store";
 import { DesktopExportButton } from "../../desktop/editor/DesktopExportButton";
 import { WindowControls } from "../../desktop/shell/WindowControls";
@@ -63,7 +62,6 @@ export const Toolbar: React.FC = () => {
     if (window.openreel?.platform === "desktop") window.dispatchEvent(new CustomEvent("openreel:menu:export"));
     else useUIStore.getState().openModal("export");
   }, []);
-  const aiMode = useUIStore((s) => s.panels.agentChat?.visible ?? false);
   const [isCompressOpen, setIsCompressOpen] = useState(false);
   // Dialogs are fetched the first time they open and then stay mounted so their close animation still plays.
   const aiConnectionOpen = useEditorWorkspaceStore((s) => s.aiConnectionOpen);

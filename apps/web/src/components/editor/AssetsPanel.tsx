@@ -17,7 +17,7 @@ import { formatMediaFileSize, getMediaFileSize, getMediaLibrarySizeLabel } from 
 import {
   Image as ImageIcon, Film, Music, Plus, Upload, Trash2,
   AlertTriangle,
-  RefreshCw, Sparkles,
+  RefreshCw,
 } from "@/icons/lucide-compat";
 import {
   BACKGROUND_PRESETS,
@@ -296,7 +296,6 @@ const MediaThumbnail: React.FC<{
   onAddToTimeline: () => void;
   /** Double-click / Enter: load the item in the Source monitor. */
   onOpenInSource: () => void;
-  onKieAI?: () => void;
   onRetryKieAI?: () => void;
 }> = ({
   item,
@@ -309,7 +308,6 @@ const MediaThumbnail: React.FC<{
   onDragStart,
   onAddToTimeline,
   onOpenInSource,
-  onKieAI,
   onRetryKieAI,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
@@ -715,7 +713,6 @@ const MediaThumbnailRow = React.memo(function MediaThumbnailRow({
       onDragStart={(e) => handlers.dragStart(e, item)}
       onAddToTimeline={() => handlers.addToTimeline(item)}
       onOpenInSource={() => handlers.openInSource(item.id)}
-      onKieAI={item.type === "image" && !item.isPending && !item.kieaiError ? () => handlers.kieAI(item) : undefined}
       onRetryKieAI={item.kieaiError && item.kieaiTaskId ? () => handlers.retryKieAI(item) : undefined}
     />
   );

@@ -1,12 +1,10 @@
 import {
-  MessageSquare,
   Film,
   Music2,
   Type,
   Pencil,
   PanelsTopLeft,
   Shapes,
-  Sparkles,
   BookText,
   SlidersHorizontal,
   Bookmark,
