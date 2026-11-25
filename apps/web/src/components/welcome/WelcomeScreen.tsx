@@ -21,7 +21,7 @@ import { Switch, Label, Button, cn } from "@openreel/ui";
 
 import { useProjectStore } from "../../stores/project-store";
 import { createEditorProject } from "../../services/project-creation";
-import { createDemoStudioProject } from "../../services/demo-project-generator";
+import { ChannelVideoBuilderDialog } from "../editor/ChannelVideoBuilderDialog";
 import { useUIStore } from "../../stores/ui-store";
 import { SOCIAL_MEDIA_PRESETS, type SocialMediaCategory } from "@openreel/core";
 import { useRouter } from "../../hooks/use-router";
@@ -157,7 +157,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ initialTab }) => {
   const [viewMode, setViewMode] = useState<ViewMode>(initialTab ?? "home");
   const [fpsPreset, setFpsPreset] = useState<StudioFpsPreset>(30);
   const [creating, setCreating] = useState(false);
-  const [creatingDemo, setCreatingDemo] = useState(false);
+  const [builderOpen, setBuilderOpen] = useState(false);
   const [creationError, setCreationError] = useState<string | null>(null);
   const creation = useRef<AbortController | null>(null);
   useEffect(() => () => creation.current?.abort(), []);
@@ -166,7 +166,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ initialTab }) => {
 
   const handleCreateProject = useCallback(
     async (option: FormatOption) => {
-      if (creation.current || creatingDemo) return;
+      if (creation.current || builderOpen) return;
       const controller = new AbortController();
       creation.current = controller;
       setCreating(true);
@@ -210,33 +210,13 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ initialTab }) => {
         if (!controller.signal.aborted) setCreating(false);
       }
     },
-    [navigate, track, fpsPreset, creatingDemo],
+    [navigate, track, fpsPreset, builderOpen],
   );
 
-  const handleCreateDemo = useCallback(async () => {
-    if (creating || creatingDemo) return;
-    setCreatingDemo(true);
-    setCreationError(null);
-    try {
-      await withUserProjectCreation(() =>
-        createDemoStudioProject({
-          width: 1280,
-          height: 720,
-          fps: fpsPreset,
-        }),
-      );
-      dismissBand();
-      navigate("editor");
-    } catch (reason) {
-      setCreationError(
-        reason instanceof Error
-          ? reason.message
-          : "Não foi possível gerar o projeto de demonstração.",
-      );
-    } finally {
-      setCreatingDemo(false);
-    }
-  }, [creating, creatingDemo, fpsPreset, dismissBand, navigate]);
+  const handleOpenBuilder = useCallback(() => {
+    if (creating) return;
+    setBuilderOpen(true);
+  }, [creating]);
 
   const handleTemplateApplied = useCallback(() => {
     navigate("editor");
@@ -341,11 +321,20 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ initialTab }) => {
   }
 
   const compact = gate.showBand;
-  const busy = creating || creatingDemo;
+  const busy = creating;
 
   return (
     <div className="fixed inset-0 z-50 bg-[#08090c] text-zinc-100 overflow-hidden">
       <CinemaBackdropCanvas />
+      <ChannelVideoBuilderDialog
+        open={builderOpen}
+        onOpenChange={setBuilderOpen}
+        defaultFps={fpsPreset}
+        onBuilt={() => {
+          dismissBand();
+          navigate("editor");
+        }}
+      />
 
       <div data-testid="welcome-scroller" className="relative z-10 h-full overflow-y-auto">
         <div className="flex min-h-full flex-col items-center px-6 py-6">
@@ -401,14 +390,14 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({ initialTab }) => {
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={() => void handleCreateDemo()}
+                    onClick={handleOpenBuilder}
                     className="studio-cta-btn"
                   >
                     <span className="studio-cta-icon" aria-hidden="true">
                       <Play size={13} fill="currentColor" />
                     </span>
                     <span className="studio-cta-label text-xs font-semibold tracking-wide">
-                      {creatingDemo ? "Gerando cenas e áudio..." : "Abrir Projeto Demo Real"}
+                      Criar Vídeo Nível Canal
                     </span>
                   </button>
                 </div>

@@ -44,6 +44,7 @@ const CollaborationDialog = lazy(() => import("./CollaborationDialog").then((m) 
 const ExportDialog = lazy(() => import("./ExportDialog").then((m) => ({ default: m.ExportDialog })));
 const ScreenRecorder = lazy(() => import("./ScreenRecorder").then((m) => ({ default: m.ScreenRecorder })));
 const ProjectPackageDialog = lazy(() => import("./ProjectPackageDialog").then((m) => ({ default: m.ProjectPackageDialog })));
+const ChannelVideoBuilderDialog = lazy(() => import("./ChannelVideoBuilderDialog").then((m) => ({ default: m.ChannelVideoBuilderDialog })));
 
 
 export const Toolbar: React.FC = () => {
@@ -65,6 +66,7 @@ export const Toolbar: React.FC = () => {
   }, []);
   const aiMode = useUIStore((s) => s.panels.agentChat?.visible ?? false);
   const [isCompressOpen, setIsCompressOpen] = useState(false);
+  const [isBuilderOpen, setIsBuilderOpen] = useState(false);
   // Dialogs are fetched the first time they open and then stay mounted so their close animation still plays.
   const aiConnectionOpen = useEditorWorkspaceStore((s) => s.aiConnectionOpen);
   const collabOpen = useCollabStore((s) => s.dialogOpen);
@@ -320,6 +322,7 @@ export const Toolbar: React.FC = () => {
         <div role="group" aria-label="Editing mode" className="workspace-mode">
           <ShadcnButton variant="ghost" aria-pressed={!aiMode} onClick={() => useUIStore.getState().setPanelVisible("agentChat", false)}>Manual</ShadcnButton>
           <ShadcnButton variant="ghost" aria-pressed={aiMode} onClick={() => { const c = useAIConnectionStore.getState(); if (!isAIConnectionReady(c)) useEditorWorkspaceStore.getState().setAIConnectionOpen(true); else useUIStore.getState().setPanelVisible("agentChat", true); }}><EditorHeaderIcon kind="ai" /> Assistente</ShadcnButton>
+          <ShadcnButton variant="ghost" title="Criar vídeo completo a partir de tema ou roteiro" aria-label="Criar vídeo automático" onClick={() => setIsBuilderOpen(true)}>Criar Vídeo</ShadcnButton>
           <ShadcnButton variant="ghost" title="Cofre de API Keys (Gemini, Groq, ElevenLabs, Kie.ai, Freepik...)" aria-label="Cadastrar APIs" onClick={() => useSettingsStore.getState().openSettings("api-keys")}>APIs</ShadcnButton>
         </div>
         <div className="workspace-history">
@@ -389,6 +392,14 @@ export const Toolbar: React.FC = () => {
       {isShareOpen && (
         <Suspense fallback={null}>
           <ProjectPackageDialog onClose={() => setIsShareOpen(false)} />
+        </Suspense>
+      )}
+      {isBuilderOpen && (
+        <Suspense fallback={null}>
+          <ChannelVideoBuilderDialog
+            open={isBuilderOpen}
+            onOpenChange={setIsBuilderOpen}
+          />
         </Suspense>
       )}
 

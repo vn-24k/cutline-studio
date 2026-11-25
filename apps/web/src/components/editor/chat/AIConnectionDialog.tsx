@@ -143,6 +143,17 @@ function ConnectionForm({ onClose }: { onClose: () => void }) {
   const [autoConfirm, setAutoConfirm] = useState(
     useSettingsStore.getState().agentAutoConfirm,
   );
+  const [serverAiInfo, setServerAiInfo] = useState<{ configured: boolean; recommendedModel?: string } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/studio-ai")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { configured?: boolean; recommendedModel?: string } | null) => {
+        if (alive && data) setServerAiInfo({ configured: Boolean(data.configured), recommendedModel: data.recommendedModel });
+      })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
   const update = (value: Partial<typeof draft>) => {
@@ -207,13 +218,28 @@ function ConnectionForm({ onClose }: { onClose: () => void }) {
       <ScrollArea className="workspace-ai-connect-scroll">
       <div className="workspace-ai-connect-content">
       <ToggleGroup type="single" value="provider" role="radiogroup" aria-label="How to power AI assist" className="workspace-ai-plans">
-        <ToggleGroupItem value="hosted" disabled title="OpenReel-hosted AI is not available in this installation">
-          <strong>OpenReel AI</strong>
-          <span>Hosted service not configured</span>
+        <ToggleGroupItem
+          value="hosted"
+          disabled={!serverAiInfo?.configured}
+          onClick={() => {
+            if (!serverAiInfo?.configured) return;
+            connection.configure({
+              provider: "compatible",
+              baseUrl: `${window.location.origin}/api/studio-ai`,
+              model: serverAiInfo.recommendedModel || "gemini-2.5-flash",
+              apiKey: "",
+            });
+            useUIStore.getState().setPanelVisible("agentChat", true);
+            onClose();
+          }}
+          title={serverAiInfo?.configured ? "API gratuita configurada nas variáveis privadas da Vercel" : "Configure GEMINI_API_KEY ou GROQ_API_KEY nas Environment Variables da Vercel"}
+        >
+          <strong>Servidor do Site (Vercel)</strong>
+          <span>{serverAiInfo?.configured ? "Pronto para usar · Clique para conectar" : "Configure GEMINI_API_KEY na Vercel"}</span>
         </ToggleGroupItem>
         <ToggleGroupItem value="provider">
-          <strong>Your own provider</strong>
-          <span>Pay them directly · no OpenReel limits</span>
+          <strong>Sua própria API</strong>
+          <span>Grátis no Google AI Studio ou Groq</span>
         </ToggleGroupItem>
       </ToggleGroup>
       <div className="workspace-ai-providers">

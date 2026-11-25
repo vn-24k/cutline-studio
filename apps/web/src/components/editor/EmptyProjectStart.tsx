@@ -5,7 +5,7 @@ import { Button, Label, RadioGroup, RadioGroupItem } from "@openreel/ui";
 import type { Project } from "@openreel/core";
 import { useProjectStore } from "../../stores/project-store";
 import { useOnboardingStore } from "../../stores/onboarding-store";
-import { createDemoStudioProject } from "../../services/demo-project-generator";
+import { ChannelVideoBuilderDialog } from "./ChannelVideoBuilderDialog";
 
 const formats = [
   {
@@ -160,31 +160,19 @@ export const EmptyProjectStart = memo(function EmptyProjectStart() {
     }
   };
 
-  const [demoBusy, setDemoBusy] = useState(false);
-
-  const handleLoadDemo = async () => {
-    if (busy || demoBusy) return;
-    setDemoBusy(true);
-    setFailure(null);
-    try {
-      await createDemoStudioProject({ width, height, fps: 30 });
-      setCreated(owner);
-    } catch (err) {
-      setFailure({
-        ...owner,
-        message: err instanceof Error ? err.message : "Could not load demo project.",
-      });
-    } finally {
-      setDemoBusy(false);
-    }
-  };
+  const [builderOpen, setBuilderOpen] = useState(false);
 
   if (formatChosen || sameOwner(created, owner) || hasContent) return null;
   return (
     <div className="workspace-empty-project">
+      <ChannelVideoBuilderDialog
+        open={builderOpen}
+        onOpenChange={setBuilderOpen}
+        onBuilt={() => setCreated(owner)}
+      />
       <div className="workspace-project-card">
         <h1>Start your project</h1>
-        <p>Pick a format or launch an instant multi-track demo.</p>
+        <p>Pick a format or generate a multi-track production with real B-rolls.</p>
         <RadioGroup
           className="workspace-formats"
           aria-label="Project format"
@@ -230,10 +218,10 @@ export const EmptyProjectStart = memo(function EmptyProjectStart() {
         <footer>
           <p>Or drop footage anywhere to match its format</p>
           <div className="flex items-center gap-2">
-            <Button variant="outline" disabled={busy || demoBusy} onClick={() => void handleLoadDemo()}>
-              {demoBusy ? "Generating demo..." : "Load Demo Reel"}
+            <Button variant="outline" disabled={busy} onClick={() => setBuilderOpen(true)}>
+              Criar Vídeo Automático
             </Button>
-            <Button disabled={busy || demoBusy} onClick={() => void create()}>
+            <Button disabled={busy} onClick={() => void create()}>
               Create project
             </Button>
           </div>

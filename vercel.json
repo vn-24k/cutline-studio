@@ -5,7 +5,7 @@
   "outputDirectory": "apps/web/dist",
   "headers": [
     {
-      "source": "/(.*)",
+      "source": "/((?!api/).*)",
       "headers": [
         { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
         { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" },
@@ -16,7 +16,11 @@
   ],
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/api/studio-ai/chat/completions",
+      "destination": "/api/studio-ai"
+    },
+    {
+      "source": "/((?!api/).*)",
       "destination": "/index.html"
     }
   ]
