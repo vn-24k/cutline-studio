@@ -1,0 +1,180 @@
+import { useId } from "react";
+import {
+  Button,
+  Label,
+  Textarea,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@openreel/ui";
+import type { NanoBanana2Input } from "../../../../services/kieai/image-generation";
+import { ASPECT_RATIO_OPTIONS_AUTO } from "./shared";
+
+interface Props {
+  value: NanoBanana2Input;
+  onChange: (v: NanoBanana2Input) => void;
+  onSubmit: () => void;
+  isLoading: boolean;
+}
+
+export function NanoBanana2Form({
+  value,
+  onChange,
+  onSubmit,
+  isLoading,
+}: Props) {
+  const id = useId();
+  return (
+    <fieldset disabled={isLoading} className="min-w-0 space-y-4 border-0 p-0">
+      <div className="space-y-1.5">
+        <Label
+          htmlFor={`${id}-prompt`}
+          className="text-[12px] font-medium text-fg-2"
+        >
+          Prompt
+        </Label>
+        <Textarea
+          id={`${id}-prompt`}
+          value={value.prompt}
+          onChange={(event) =>
+            onChange({ ...value, prompt: event.target.value })
+          }
+          required
+          disabled={isLoading}
+          placeholder="Describe the image you want to generate..."
+          maxLength={2000}
+          rows={4}
+          className="resize-y border-border bg-bg-2 text-[12px] leading-5 text-fg placeholder:text-fg-3"
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="min-w-0 space-y-1.5">
+          <Label
+            htmlFor={`${id}-aspect-ratio`}
+            className="text-[12px] font-medium text-fg-2"
+          >
+            Aspect Ratio
+          </Label>
+          <Select
+            value={value.aspect_ratio ?? "1:1"}
+            onValueChange={(aspect_ratio) =>
+              onChange({
+                ...value,
+                aspect_ratio: aspect_ratio as NanoBanana2Input["aspect_ratio"],
+              })
+            }
+            disabled={isLoading}
+          >
+            <SelectTrigger
+              id={`${id}-aspect-ratio`}
+              className="h-8 min-w-0 border-border bg-bg-2 text-[12px]"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[...ASPECT_RATIO_OPTIONS_AUTO].map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="min-w-0 space-y-1.5">
+          <Label
+            htmlFor={`${id}-resolution`}
+            className="text-[12px] font-medium text-fg-2"
+          >
+            Resolution
+          </Label>
+          <Select
+            value={value.resolution ?? "2K"}
+            onValueChange={(resolution) =>
+              onChange({
+                ...value,
+                resolution: resolution as NanoBanana2Input["resolution"],
+              })
+            }
+            disabled={isLoading}
+          >
+            <SelectTrigger
+              id={`${id}-resolution`}
+              className="h-8 min-w-0 border-border bg-bg-2 text-[12px]"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[
+                { value: "1K", label: "1K" },
+                { value: "2K", label: "2K" },
+                { value: "4K", label: "4K" },
+              ].map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="min-w-0 space-y-1.5">
+          <Label
+            htmlFor={`${id}-format`}
+            className="text-[12px] font-medium text-fg-2"
+          >
+            Format
+          </Label>
+          <Select
+            value={value.output_format ?? "png"}
+            onValueChange={(output_format) =>
+              onChange({
+                ...value,
+                output_format:
+                  output_format as NanoBanana2Input["output_format"],
+              })
+            }
+            disabled={isLoading}
+          >
+            <SelectTrigger
+              id={`${id}-format`}
+              className="h-8 min-w-0 border-border bg-bg-2 text-[12px]"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[
+                { value: "png", label: "PNG" },
+                { value: "jpg", label: "JPG" },
+              ].map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <Button
+        onClick={onSubmit}
+        type="button"
+        aria-label={
+          (isLoading
+            ? "Generating..."
+            : "Generate with Nano Banana 2"
+          ).trim() || undefined
+        }
+        disabled={isLoading || !value.prompt.trim()}
+        className="h-8 w-full bg-accent text-[12px] text-accent-fg hover:bg-accent/90"
+      >
+        <span className="truncate">
+          {isLoading ? "Generating..." : "Generate with Nano Banana 2"}
+        </span>
+      </Button>
+    </fieldset>
+  );
+}

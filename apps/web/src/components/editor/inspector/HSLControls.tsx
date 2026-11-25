@@ -1,0 +1,279 @@
+import React, { useCallback, useState, useMemo } from "react";
+import { Button } from "@openreel/ui";
+import { cn } from "@openreel/ui";
+
+import { PropertySlider } from "./shell/PropertySlider";
+import { RotateCcw } from "@/icons/lucide-compat";
+import type { HSLValues } from "@openreel/core";
+
+const COLOR_RANGES = [
+  { key: "reds", label: "R", fullLabel: "Reds", color: "#ef4444", index: 0 },
+  {
+    key: "oranges",
+    label: "O",
+    fullLabel: "Oranges",
+    color: "#f97316",
+    index: 1,
+  },
+  {
+    key: "yellows",
+    label: "Y",
+    fullLabel: "Yellows",
+    color: "#eab308",
+    index: 2,
+  },
+  {
+    key: "greens",
+    label: "G",
+    fullLabel: "Greens",
+    color: "#22c55e",
+    index: 3,
+  },
+  { key: "cyans", label: "C", fullLabel: "Cyans", color: "#06b6d4", index: 4 },
+  { key: "blues", label: "B", fullLabel: "Blues", color: "#3b82f6", index: 5 },
+  {
+    key: "purples",
+    label: "P",
+    fullLabel: "Purples",
+    color: "#a855f7",
+    index: 6,
+  },
+  {
+    key: "magentas",
+    label: "M",
+    fullLabel: "Magentas",
+    color: "#ec4899",
+    index: 7,
+  },
+] as const;
+
+/**
+ * Props for the HSLControls component
+ */
+interface HSLControlsProps {
+  values: HSLValues;
+  onChange: (values: HSLValues) => void;
+  onReset?: () => void;
+}
+
+/**
+ * Color range tab component
+ */
+const ColorTab: React.FC<{
+  color: (typeof COLOR_RANGES)[number];
+  isActive: boolean;
+  onClick: () => void;
+}> = ({ color, isActive, onClick }) => (
+  <Button variant="ghost" onClick={onClick} style={{
+      borderBottom: isActive
+        ? `2px solid ${color.color}`
+        : "2px solid transparent",
+    }} type="button" aria-label={color.fullLabel} className={cn("group/card block h-auto min-w-0 whitespace-normal rounded-[7px] border text-left transition-[background-color,border-color,box-shadow,transform] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50", "border-border bg-bg-1 hover:bg-bg-2", "p-3", `flex-1 py-1.5 text-[9px] font-medium rounded transition-all ${
+      isActive
+        ? "bg-bg-2 text-fg shadow-sm"
+        : "text-fg-3 hover:text-fg-2"
+    }`)}>
+    {color.label}
+  </Button>
+);
+
+/**
+ * HSL Slider component
+ */
+const HSLSlider: React.FC<{
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  min: number;
+  max: number;
+  unit?: string;
+  color?: string;
+}> = ({ label, value, onChange, min, max, unit = "" }) => (
+  <PropertySlider
+    label={label}
+    value={value}
+    onChange={onChange}
+    min={min}
+    max={max}
+    step={1}
+    formatValue={(nextValue) =>
+      `${nextValue > 0 ? "+" : ""}${Math.round(nextValue)}${unit}`
+    }
+  />
+);
+
+/**
+ * HSLControls Component
+ *
+ * - 7.1: Display H/S/L sliders for 8 color ranges
+ * - 7.2: Shift only pixels within target hue range
+ * - 7.3: Increase/decrease saturation for target hue range
+ * - 7.4: Brighten/darken only pixels within target hue range
+ */
+export const HSLControls: React.FC<HSLControlsProps> = ({
+  values,
+  onChange,
+  onReset,
+}) => {
+  const [activeColorIndex, setActiveColorIndex] = useState(0);
+
+  // Get current color info
+  const activeColor = COLOR_RANGES[activeColorIndex];
+
+  // Get current values for active color
+  const currentHue = values.hue[activeColorIndex] || 0;
+  const currentSaturation = (values.saturation[activeColorIndex] || 0) * 100;
+  const currentLuminance = (values.luminance[activeColorIndex] || 0) * 100;
+
+  // Handle hue change
+  const handleHueChange = useCallback(
+    (hue: number) => {
+      const newHue = [...values.hue];
+      newHue[activeColorIndex] = hue;
+      onChange({ ...values, hue: newHue });
+    },
+    [values, activeColorIndex, onChange],
+  );
+
+  // Handle saturation change
+  const handleSaturationChange = useCallback(
+    (saturation: number) => {
+      const newSaturation = [...values.saturation];
+      newSaturation[activeColorIndex] = saturation / 100;
+      onChange({ ...values, saturation: newSaturation });
+    },
+    [values, activeColorIndex, onChange],
+  );
+
+  // Handle luminance change
+  const handleLuminanceChange = useCallback(
+    (luminance: number) => {
+      const newLuminance = [...values.luminance];
+      newLuminance[activeColorIndex] = luminance / 100;
+      onChange({ ...values, luminance: newLuminance });
+    },
+    [values, activeColorIndex, onChange],
+  );
+
+  // Reset current color
+  const handleResetColor = useCallback(() => {
+    const newHue = [...values.hue];
+    const newSaturation = [...values.saturation];
+    const newLuminance = [...values.luminance];
+
+    newHue[activeColorIndex] = 0;
+    newSaturation[activeColorIndex] = 0;
+    newLuminance[activeColorIndex] = 0;
+
+    onChange({
+      hue: newHue,
+      saturation: newSaturation,
+      luminance: newLuminance,
+    });
+  }, [values, activeColorIndex, onChange]);
+
+  // Check if current color has any adjustments
+  const hasAdjustments = useMemo(() => {
+    return (
+      currentHue !== 0 || currentSaturation !== 0 || currentLuminance !== 0
+    );
+  }, [currentHue, currentSaturation, currentLuminance]);
+
+  return (
+    <div className="space-y-3">
+      {/* Reset All Button */}
+      {onReset && (
+        <div className="flex justify-end">
+          <Button onClick={onReset} type="button" aria-label="Reset All" className="min-w-0 justify-center rounded-[7px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 h-7 bg-transparent hover:bg-bg-2 flex items-center gap-1 px-2 py-1 text-[10px] text-fg-3 hover:text-fg transition-colors">
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center">{<RotateCcw size={10} />}</span>
+            <span className="truncate">{"Reset All"}</span>
+          </Button>
+        </div>
+      )}
+
+      {/* Color Range Tabs */}
+      <div className="flex gap-0.5">
+        {COLOR_RANGES.map((color) => (
+          <ColorTab
+            key={color.key}
+            color={color}
+            isActive={activeColorIndex === color.index}
+            onClick={() => setActiveColorIndex(color.index)}
+          />
+        ))}
+      </div>
+
+      {/* Active Color Label */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div
+            className="w-3 h-3 rounded-full"
+            style={{ backgroundColor: activeColor.color }}
+          />
+          <span className="text-fg text-[11px] font-medium">
+            {activeColor.fullLabel}
+          </span>
+        </div>
+        {hasAdjustments && (
+          <Button onClick={handleResetColor} type="button" aria-label="Reset" className="inline-flex min-w-0 items-center justify-center gap-1.5 rounded-[7px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 h-7 px-2.5 bg-transparent hover:bg-bg-2 text-[9px] text-fg-3 hover:text-fg-2 transition-colors">
+            <span className="truncate">{"Reset"}</span>
+          </Button>
+        )}
+      </div>
+
+      {/* HSL Sliders */}
+      <div className="space-y-3">
+        <HSLSlider
+          label="Hue"
+          value={currentHue}
+          onChange={handleHueChange}
+          min={-180}
+          max={180}
+          unit="°"
+          color={activeColor.color}
+        />
+        <HSLSlider
+          label="Saturation"
+          value={currentSaturation}
+          onChange={handleSaturationChange}
+          min={-100}
+          max={100}
+          unit="%"
+          color={activeColor.color}
+        />
+        <HSLSlider
+          label="Luminance"
+          value={currentLuminance}
+          onChange={handleLuminanceChange}
+          min={-100}
+          max={100}
+          unit="%"
+          color={activeColor.color}
+        />
+      </div>
+
+      {/* Visual indicator of all color adjustments */}
+      <div className="pt-2 border-t border-border">
+        <div className="flex gap-1">
+          {COLOR_RANGES.map((color) => {
+            const hasAdj =
+              values.hue[color.index] !== 0 ||
+              values.saturation[color.index] !== 0 ||
+              values.luminance[color.index] !== 0;
+            return (
+              <div
+                key={color.key}
+                className={`flex-1 h-1 rounded-full transition-all ${
+                  hasAdj ? "opacity-100" : "opacity-20"
+                }`}
+                style={{ backgroundColor: color.color }}
+                title={`${color.fullLabel}${hasAdj ? " (adjusted)" : ""}`}
+              />
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+

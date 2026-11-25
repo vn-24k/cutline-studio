@@ -1,0 +1,298 @@
+import gsap from "gsap";
+import { MotionPathPlugin } from "gsap/MotionPathPlugin";
+
+// Registered on first use, not at import time: a module-level side effect here kept gsap (~300 KB)
+// and its plugin in the startup entry chunk even though only the Motion Path inspector uses it.
+let pluginsRegistered = false;
+function ensureGsapPlugins(): void {
+  if (pluginsRegistered) return;
+  gsap.registerPlugin(MotionPathPlugin);
+  pluginsRegistered = true;
+}
+
+import { generateBezierPath, generateDefaultControlPoints, type GSAPMotionPathPoint, type MotionPathConfig } from "./motion-path-geometry";
+export { generateBezierPath, generateDefaultControlPoints };
+export type { GSAPMotionPathPoint, MotionPathConfig };
+
+interface GSAPAnimationConfig {
+  duration: number;
+  ease: string;
+  delay?: number;
+  repeat?: number;
+  yoyo?: boolean;
+}
+
+
+function sampleMotionPath(
+  points: GSAPMotionPathPoint[],
+  time: number
+): { x: number; y: number; rotation?: number } | null {
+  if (points.length === 0) return null;
+  if (points.length === 1) return { x: points[0].x, y: points[0].y };
+
+  const sortedPoints = [...points].sort((a, b) => a.time - b.time);
+
+  if (time <= sortedPoints[0].time) {
+    return { x: sortedPoints[0].x, y: sortedPoints[0].y };
+  }
+
+  if (time >= sortedPoints[sortedPoints.length - 1].time) {
+    const last = sortedPoints[sortedPoints.length - 1];
+    return { x: last.x, y: last.y };
+  }
+
+  let startIdx = 0;
+  for (let i = 0; i < sortedPoints.length - 1; i++) {
+    if (time >= sortedPoints[i].time && time <= sortedPoints[i + 1].time) {
+      startIdx = i;
+      break;
+    }
+  }
+
+  const p0 = sortedPoints[startIdx];
+  const p1 = sortedPoints[startIdx + 1];
+  const segmentDuration = p1.time - p0.time;
+  const t = segmentDuration > 0 ? (time - p0.time) / segmentDuration : 0;
+
+  if (p0.controlPoints && p1.controlPoints) {
+    return cubicBezierInterpolate(
+      { x: p0.x, y: p0.y },
+      p0.controlPoints.cp2,
+      p1.controlPoints.cp1,
+      { x: p1.x, y: p1.y },
+      t
+    );
+  }
+
+  return {
+    x: p0.x + (p1.x - p0.x) * t,
+    y: p0.y + (p1.y - p0.y) * t,
+  };
+}
+
+function cubicBezierInterpolate(
+  p0: { x: number; y: number },
+  cp1: { x: number; y: number },
+  cp2: { x: number; y: number },
+  p1: { x: number; y: number },
+  t: number
+): { x: number; y: number; rotation?: number } {
+  const oneMinusT = 1 - t;
+  const oneMinusT2 = oneMinusT * oneMinusT;
+  const oneMinusT3 = oneMinusT2 * oneMinusT;
+  const t2 = t * t;
+  const t3 = t2 * t;
+
+  const x =
+    oneMinusT3 * p0.x +
+    3 * oneMinusT2 * t * cp1.x +
+    3 * oneMinusT * t2 * cp2.x +
+    t3 * p1.x;
+
+  const y =
+    oneMinusT3 * p0.y +
+    3 * oneMinusT2 * t * cp1.y +
+    3 * oneMinusT * t2 * cp2.y +
+    t3 * p1.y;
+
+  const dt = 0.001;
+  const tNext = Math.min(1, t + dt);
+  const oneMinusTNext = 1 - tNext;
+  const xNext =
+    Math.pow(oneMinusTNext, 3) * p0.x +
+    3 * Math.pow(oneMinusTNext, 2) * tNext * cp1.x +
+    3 * oneMinusTNext * Math.pow(tNext, 2) * cp2.x +
+    Math.pow(tNext, 3) * p1.x;
+  const yNext =
+    Math.pow(oneMinusTNext, 3) * p0.y +
+    3 * Math.pow(oneMinusTNext, 2) * tNext * cp1.y +
+    3 * oneMinusTNext * Math.pow(tNext, 2) * cp2.y +
+    Math.pow(tNext, 3) * p1.y;
+
+  const rotation = Math.atan2(yNext - y, xNext - x) * (180 / Math.PI);
+
+  return { x, y, rotation };
+}
+
+function catmullRomInterpolate(
+  points: GSAPMotionPathPoint[],
+  t: number,
+  tension: number = 0.5
+): { x: number; y: number } {
+  if (points.length < 2) {
+    return points[0] || { x: 0, y: 0 };
+  }
+
+  const numSegments = points.length - 1;
+  const segment = Math.min(Math.floor(t * numSegments), numSegments - 1);
+  const localT = (t * numSegments) % 1;
+
+  const p0 = points[Math.max(0, segment - 1)];
+  const p1 = points[segment];
+  const p2 = points[Math.min(points.length - 1, segment + 1)];
+  const p3 = points[Math.min(points.length - 1, segment + 2)];
+
+  const t2 = localT * localT;
+  const t3 = t2 * localT;
+
+  const m1x = tension * (p2.x - p0.x);
+  const m1y = tension * (p2.y - p0.y);
+  const m2x = tension * (p3.x - p1.x);
+  const m2y = tension * (p3.y - p1.y);
+
+  const a = 2 * t3 - 3 * t2 + 1;
+  const b = t3 - 2 * t2 + localT;
+  const c = -2 * t3 + 3 * t2;
+  const d = t3 - t2;
+
+  return {
+    x: a * p1.x + b * m1x + c * p2.x + d * m2x,
+    y: a * p1.y + b * m1y + c * p2.y + d * m2y,
+  };
+}
+
+class GSAPAnimationEngine {
+  private timelines: Map<string, gsap.core.Timeline> = new Map();
+  private motionPaths: Map<string, MotionPathConfig> = new Map();
+
+  createTimeline(clipId: string, config?: GSAPAnimationConfig): gsap.core.Timeline {
+    if (this.timelines.has(clipId)) {
+      this.timelines.get(clipId)!.kill();
+    }
+
+    ensureGsapPlugins();
+    const timeline = gsap.timeline({
+      paused: true,
+      defaults: {
+        duration: config?.duration || 1,
+        ease: config?.ease || "none",
+      },
+    });
+
+    this.timelines.set(clipId, timeline);
+    return timeline;
+  }
+
+  getTimeline(clipId: string): gsap.core.Timeline | undefined {
+    return this.timelines.get(clipId);
+  }
+
+  removeTimeline(clipId: string): void {
+    const timeline = this.timelines.get(clipId);
+    if (timeline) {
+      timeline.kill();
+      this.timelines.delete(clipId);
+    }
+  }
+
+  setMotionPath(clipId: string, config: Omit<MotionPathConfig, "clipId">): void {
+    this.motionPaths.set(clipId, { ...config, clipId });
+  }
+
+  getMotionPath(clipId: string): MotionPathConfig | undefined {
+    return this.motionPaths.get(clipId);
+  }
+
+  removeMotionPath(clipId: string): void {
+    this.motionPaths.delete(clipId);
+  }
+
+  updateGSAPMotionPathPoint(
+    clipId: string,
+    pointIndex: number,
+    updates: Partial<GSAPMotionPathPoint>
+  ): void {
+    const config = this.motionPaths.get(clipId);
+    if (!config || pointIndex < 0 || pointIndex >= config.points.length) return;
+
+    config.points[pointIndex] = { ...config.points[pointIndex], ...updates };
+    this.motionPaths.set(clipId, config);
+  }
+
+  addGSAPMotionPathPoint(clipId: string, point: GSAPMotionPathPoint): void {
+    const config = this.motionPaths.get(clipId);
+    if (!config) return;
+
+    config.points.push(point);
+    config.points.sort((a, b) => a.time - b.time);
+    config.points = generateDefaultControlPoints(config.points);
+    this.motionPaths.set(clipId, config);
+  }
+
+  removeGSAPMotionPathPoint(clipId: string, pointIndex: number): void {
+    const config = this.motionPaths.get(clipId);
+    if (!config || pointIndex < 0 || pointIndex >= config.points.length) return;
+    if (config.points.length <= 2) return;
+
+    config.points.splice(pointIndex, 1);
+    config.points = generateDefaultControlPoints(config.points);
+    this.motionPaths.set(clipId, config);
+  }
+
+  samplePositionAtTime(
+    clipId: string,
+    time: number,
+    clipDuration: number
+  ): { x: number; y: number; rotation?: number } | null {
+    const config = this.motionPaths.get(clipId);
+    if (!config || !config.enabled || config.points.length === 0) return null;
+
+    const normalizedTime = clipDuration > 0 ? time / clipDuration : 0;
+    const clampedTime = Math.max(0, Math.min(1, normalizedTime));
+
+    if (config.pathType === "catmull-rom") {
+      return catmullRomInterpolate(config.points, clampedTime);
+    }
+
+    return sampleMotionPath(config.points, clampedTime);
+  }
+
+  getSVGPath(clipId: string): string {
+    const config = this.motionPaths.get(clipId);
+    if (!config) return "";
+
+    return generateBezierPath(config.points);
+  }
+
+  sampleFrameTransforms(
+    clipId: string,
+    startTime: number,
+    endTime: number,
+    frameRate: number
+  ): Array<{ time: number; x: number; y: number; rotation?: number }> {
+    const config = this.motionPaths.get(clipId);
+    if (!config || !config.enabled) return [];
+
+    const frames: Array<{ time: number; x: number; y: number; rotation?: number }> = [];
+    const duration = endTime - startTime;
+    const frameCount = Math.ceil(duration * frameRate);
+
+    for (let i = 0; i <= frameCount; i++) {
+      const time = startTime + (i / frameRate);
+      const normalizedTime = duration > 0 ? (time - startTime) / duration : 0;
+      const position = sampleMotionPath(config.points, normalizedTime);
+      if (position) {
+        frames.push({ time, ...position });
+      }
+    }
+
+    return frames;
+  }
+
+  dispose(): void {
+    for (const timeline of this.timelines.values()) {
+      timeline.kill();
+    }
+    this.timelines.clear();
+    this.motionPaths.clear();
+  }
+}
+
+let gsapEngineInstance: GSAPAnimationEngine | null = null;
+
+export function getGSAPEngine(): GSAPAnimationEngine {
+  if (!gsapEngineInstance) {
+    gsapEngineInstance = new GSAPAnimationEngine();
+  }
+  return gsapEngineInstance;
+}

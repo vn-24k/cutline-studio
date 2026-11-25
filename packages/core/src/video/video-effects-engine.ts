@@ -1,0 +1,2199 @@
+import type { Effect } from "../types/timeline";
+import { releaseGLContext, trackGLContext } from "./gl-context";
+import { applyIrisMaskToContext } from "./clip-iris";
+import {
+  RendererFactory,
+  type Renderer,
+  type RendererConfig,
+  isWebGPUSupported,
+} from "./renderer-factory";
+import { MotionShaderRenderer } from "../motion/motion-shader-renderer";
+import { getMotionShaderDef } from "../motion/shaders";
+import type { MotionShaderDef } from "../motion/shaders";
+import {
+  PRO_EFFECT_TYPES,
+  applyProEffect,
+  isProEffectNeutral,
+  isProEffectType,
+  proEffectGpuUniforms,
+  type ProEffectType,
+} from "./pro-effects";
+import { isTemporalEffectType } from "./temporal-effects";
+import { PRO_EFFECT_SHADER_DEFS } from "./pro-effect-shaders";
+import { isVrEffectType, isVrRuntimeLoaded, loadVrRuntime } from "./vr-runtime-loader";
+import { isPluginEffectType } from "../plugins/manifest";
+import { drawBurnIn, isBurnInEffectType } from "./burn-in";
+import { getPluginHost } from "../plugins/plugin-host";
+
+interface ResolvedShaderEffect {
+  readonly def: MotionShaderDef;
+  readonly params: Record<string, number | string>;
+  readonly time: number;
+}
+
+function readShaderTime(params: Record<string, unknown>): number {
+  const raw = params.time;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
+}
+
+function readShaderParamValue(raw: unknown): number | string | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string") return raw;
+  return undefined;
+}
+
+function readEffectNumber(raw: unknown, fallback: number): number {
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+}
+
+interface FilterResult {
+  image: ImageBitmap;
+  processingTime: number;
+  gpuAccelerated: boolean;
+}
+
+interface VideoEffectsConfig {
+  width: number;
+  height: number;
+  useGPU?: boolean;
+  preferWebGPU?: boolean;
+}
+
+// WebGL2 shader sources for video effects
+
+const VERTEX_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 a_position;
+in vec2 a_texCoord;
+
+out vec2 v_texCoord;
+
+void main() {
+ gl_Position = vec4(a_position, 0.0, 1.0);
+ v_texCoord = a_texCoord;
+}
+`;
+
+const PASSTHROUGH_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+
+void main() {
+ fragColor = texture(u_texture, v_texCoord);
+}
+`;
+
+const BRIGHTNESS_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_brightness;
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ vec3 rgb = color.rgb + u_brightness;
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const CONTRAST_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_contrast;
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ vec3 rgb = (color.rgb - 0.5) * u_contrast + 0.5;
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const SATURATION_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_saturation;
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ float luminance = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+ vec3 rgb = mix(vec3(luminance), color.rgb, u_saturation);
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const HUE_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_hueRotation;
+
+vec3 rgb2hsv(vec3 c) {
+ vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+ vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+ vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+ float d = q.x - min(q.w, q.y);
+ float e = 1.0e-10;
+ return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+vec3 hsv2rgb(vec3 c) {
+ vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+ vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+ return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ vec3 hsv = rgb2hsv(color.rgb);
+ hsv.x = fract(hsv.x + u_hueRotation / 360.0);
+ vec3 rgb = hsv2rgb(hsv);
+ fragColor = vec4(rgb, color.a);
+}
+`;
+
+const BLUR_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_radius;
+
+void main() {
+ vec2 texelSize = 1.0 / u_resolution;
+ vec4 color = vec4(0.0);
+ float total = 0.0;
+ 
+ int r = int(min(u_radius, 10.0));
+ for (int x = -r; x <= r; x++) {
+ for (int y = -r; y <= r; y++) {
+ vec2 offset = vec2(float(x), float(y)) * texelSize;
+ color += texture(u_texture, v_texCoord + offset);
+ total += 1.0;
+ }
+ }
+ 
+ fragColor = color / total;
+}
+`;
+
+const SHARPEN_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_amount;
+
+void main() {
+ vec2 texelSize = 1.0 / u_resolution;
+ 
+ vec4 center = texture(u_texture, v_texCoord);
+ vec4 top = texture(u_texture, v_texCoord + vec2(0.0, -texelSize.y));
+ vec4 bottom = texture(u_texture, v_texCoord + vec2(0.0, texelSize.y));
+ vec4 left = texture(u_texture, v_texCoord + vec2(-texelSize.x, 0.0));
+ vec4 right = texture(u_texture, v_texCoord + vec2(texelSize.x, 0.0));
+ 
+ vec4 sharpened = center * (1.0 + 4.0 * u_amount) - (top + bottom + left + right) * u_amount;
+ fragColor = vec4(clamp(sharpened.rgb, 0.0, 1.0), center.a);
+}
+`;
+
+const VIGNETTE_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_amount;
+uniform float u_midpoint;
+uniform float u_feather;
+uniform float u_roundness;
+uniform float u_aspect;
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ vec2 center = vec2(0.5, 0.5);
+ float dist = distance(v_texCoord, center);
+ // roundness 0.5 keeps the frame-following oval; 0 squares it off, 1 is a circle.
+ vec2 d = (v_texCoord - center) * 2.0;
+ float k = 0.70710678;
+ if (u_roundness < 0.5) {
+  float box = max(abs(d.x), abs(d.y)) * k;
+  dist = mix(box, dist, u_roundness / 0.5);
+ } else if (u_roundness > 0.5) {
+  vec2 c = d * vec2(min(1.0, u_aspect), min(1.0, 1.0 / u_aspect));
+  dist = mix(dist, length(c) * 0.5, (u_roundness - 0.5) / 0.5);
+ }
+ float vignette = smoothstep(u_midpoint - u_feather, u_midpoint + u_feather, dist);
+ vec3 rgb = color.rgb * (1.0 - vignette * u_amount);
+ fragColor = vec4(rgb, color.a);
+}
+`;
+
+const GRAIN_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_amount;
+uniform float u_size;
+uniform float u_time;
+
+float random(vec2 st) {
+ return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ vec2 st = v_texCoord * u_size + u_time;
+ float noise = random(st) * 2.0 - 1.0;
+ vec3 rgb = color.rgb + noise * u_amount;
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const CHROMA_KEY_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform vec3 u_keyColor;
+uniform float u_tolerance;
+uniform float u_softness;
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ float diff = distance(color.rgb, u_keyColor);
+ float alpha = smoothstep(u_tolerance - u_softness, u_tolerance + u_softness, diff);
+ fragColor = vec4(color.rgb, color.a * alpha);
+}
+`;
+
+const TEMPERATURE_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_temperature; // -1 (cool/blue) to 1 (warm/orange)
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ 
+ // Temperature adjustment using color balance
+
+ vec3 rgb = color.rgb;
+ 
+ if (u_temperature > 0.0) {
+ rgb.r = rgb.r + u_temperature * 0.2;
+ rgb.g = rgb.g + u_temperature * 0.1;
+ rgb.b = rgb.b - u_temperature * 0.2;
+ } else {
+ rgb.r = rgb.r + u_temperature * 0.2;
+ rgb.g = rgb.g + u_temperature * 0.05;
+ rgb.b = rgb.b - u_temperature * 0.2;
+ }
+ 
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const TINT_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_tint; // -1 (green) to 1 (magenta)
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ 
+ // Tint adjustment
+
+ vec3 rgb = color.rgb;
+ 
+ rgb.r = rgb.r + u_tint * 0.1;
+ rgb.g = rgb.g - u_tint * 0.2;
+ rgb.b = rgb.b + u_tint * 0.1;
+ 
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+const TONAL_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+out vec4 fragColor;
+
+uniform sampler2D u_texture;
+uniform float u_shadows; // -1 to 1
+uniform float u_midtones; // -1 to 1
+uniform float u_highlights; // -1 to 1
+
+void main() {
+ vec4 color = texture(u_texture, v_texCoord);
+ float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+ float shadowWeight = 1.0 - smoothstep(0.0, 0.33, luma);
+ float highlightWeight = smoothstep(0.66, 1.0, luma);
+ float midtoneWeight = 1.0 - shadowWeight - highlightWeight;
+ midtoneWeight = max(0.0, midtoneWeight);
+ vec3 rgb = color.rgb;
+ rgb += u_shadows * shadowWeight * 0.3;
+ rgb += u_midtones * midtoneWeight * 0.3;
+ rgb += u_highlights * highlightWeight * 0.3;
+ 
+ fragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+`;
+
+interface ShaderProgram {
+  program: WebGLProgram;
+  uniforms: Map<string, WebGLUniformLocation>;
+  attributes: Map<string, number>;
+}
+
+type FilterType =
+  | "brightness"
+  | "contrast"
+  | "saturation"
+  | "hue"
+  | "blur"
+  | "sharpen"
+  | "vignette"
+  | "grain"
+  | "chromaKey"
+  | "temperature"
+  | "tint"
+  | "tonal"
+  | "shadow"
+  | "glow"
+  | "motion-blur"
+  | "radial-blur"
+  | "chromatic-aberration"
+  | ProEffectType;
+
+const GL_FRAGMENT_SOURCES: Partial<Record<FilterType | "passthrough", string>> = {
+  passthrough: PASSTHROUGH_SHADER,
+  brightness: BRIGHTNESS_SHADER,
+  contrast: CONTRAST_SHADER,
+  saturation: SATURATION_SHADER,
+  hue: HUE_SHADER,
+  blur: BLUR_SHADER,
+  sharpen: SHARPEN_SHADER,
+  vignette: VIGNETTE_SHADER,
+  grain: GRAIN_SHADER,
+  chromaKey: CHROMA_KEY_SHADER,
+  temperature: TEMPERATURE_SHADER,
+  tint: TINT_SHADER,
+  tonal: TONAL_SHADER,
+};
+
+export class VideoEffectsEngine {
+  private canvas: OffscreenCanvas | null = null;
+  private gl: WebGL2RenderingContext | null = null;
+  private shaders: Map<FilterType | "passthrough", ShaderProgram> = new Map();
+  private quadBuffer: WebGLBuffer | null = null;
+  private texCoordBuffer: WebGLBuffer | null = null;
+  private framebuffers: WebGLFramebuffer[] = [];
+  private renderTextures: WebGLTexture[] = [];
+  private currentRenderTarget = 0;
+  private width: number;
+  private height: number;
+  private useGPU: boolean;
+  private preferWebGPU: boolean;
+  private initialized = false;
+  private initializing = false;
+  private initPromise: Promise<boolean> | null = null;
+
+  // New WebGPU renderer via RendererFactory
+  private renderer: Renderer | null = null;
+  private rendererFactory: RendererFactory | null = null;
+  private useNewRenderer = false;
+
+  // Reusable CPU-effects canvas (FX3): avoids per-frame OffscreenCanvas allocation
+  private _fxCanvas: OffscreenCanvas | null = null;
+  private _fxCtx: OffscreenCanvasRenderingContext2D | null = null;
+  private _fxScratchCanvas: OffscreenCanvas | null = null;
+  private _fxScratchCtx: OffscreenCanvasRenderingContext2D | null = null;
+  private _shaderAlphaCanvas: OffscreenCanvas | null = null;
+  private _shaderAlphaCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+  private _shaderRenderer: MotionShaderRenderer | null = null;
+  // Pro effect types whose GLSL path failed once; they stay on the CPU path.
+  private readonly _proGpuFailed = new Set<ProEffectType>();
+  private static _proGpuSupported: boolean | null = null;
+
+  constructor(config: VideoEffectsConfig) {
+    this.width = config.width;
+    this.height = config.height;
+    this.useGPU = config.useGPU ?? true;
+    this.preferWebGPU = config.preferWebGPU ?? true;
+    void this._applyEffectsWithNewRenderer;
+    void this._applyEffectsGPU;
+  }
+
+  async initialize(): Promise<boolean> {
+    if (this.initialized) return true;
+
+    if (this.initializing && this.initPromise) {
+      return this.initPromise;
+    }
+
+    this.initializing = true;
+    this.initPromise = this.doInitialize();
+
+    try {
+      const result = await this.initPromise;
+      this.initialized = result;
+      return result;
+    } finally {
+      this.initializing = false;
+    }
+  }
+
+  private async doInitialize(): Promise<boolean> {
+    if (this.useGPU) {
+      if (this.preferWebGPU && isWebGPUSupported()) {
+        try {
+          await this.initializeNewRenderer();
+          return true;
+        } catch (error) {
+          console.warn(
+            "[VideoEffectsEngine] WebGPU initialization failed, falling back to WebGL2:",
+            error,
+          );
+        }
+      }
+
+      if (VideoEffectsEngine.isWebGL2Supported()) {
+        this.initializeWebGL();
+        return true;
+      }
+    }
+
+    return true;
+  }
+
+  private async initializeNewRenderer(): Promise<void> {
+    try {
+      this.rendererFactory = RendererFactory.getInstance();
+      this.canvas = new OffscreenCanvas(this.width, this.height);
+
+      const config: RendererConfig = {
+        canvas: this.canvas,
+        width: this.width,
+        height: this.height,
+        preferredRenderer: this.preferWebGPU ? "webgpu" : "canvas2d",
+      };
+
+      this.renderer = await this.rendererFactory.createRenderer(config);
+      this.useNewRenderer = true;
+    } catch (error) {
+      console.warn(
+        "[VideoEffectsEngine] Failed to initialize new renderer, falling back to WebGL2:",
+        error,
+      );
+      this.useNewRenderer = false;
+      this.initializeWebGL();
+    }
+  }
+
+  private initializeWebGL(): void {
+    this.canvas = new OffscreenCanvas(this.width, this.height);
+    const gl = this.canvas.getContext("webgl2", {
+      preserveDrawingBuffer: true,
+      premultipliedAlpha: true,
+      alpha: true,
+      antialias: false,
+    });
+
+    if (!gl) {
+      console.warn("WebGL2 not available, falling back to CPU processing");
+      this.useGPU = false;
+      return;
+    }
+
+    this.gl = trackGLContext(gl);
+    this.quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+      gl.STATIC_DRAW,
+    );
+    this.texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]),
+      gl.STATIC_DRAW,
+    );
+    for (let i = 0; i < 2; i++) {
+      const fb = gl.createFramebuffer()!;
+      const tex = this.createRenderTexture();
+      this.framebuffers.push(fb);
+      this.renderTextures.push(tex);
+    }
+
+    // Shader programs are compiled on first use (getShader), not here.
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  private createRenderTexture(): WebGLTexture {
+    const gl = this.gl!;
+    const texture = gl.createTexture()!;
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      this.width,
+      this.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null,
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    return texture;
+  }
+
+  /** Compiles (and caches) the WebGL2 program for a filter on first use; undefined for unknown filters. */
+  private getShader(name: FilterType | "passthrough"): ShaderProgram | undefined {
+    const cached = this.shaders.get(name);
+    if (cached) return cached;
+    const source = GL_FRAGMENT_SOURCES[name];
+    if (!source || !this.gl) return undefined;
+    this.compileShader(name, VERTEX_SHADER, source);
+    return this.shaders.get(name);
+  }
+
+  private compileShader(
+    name: FilterType | "passthrough",
+    vertexSrc: string,
+    fragmentSrc: string,
+  ): void {
+    const gl = this.gl!;
+
+    const vertexShader = gl.createShader(gl.VERTEX_SHADER)!;
+    gl.shaderSource(vertexShader, vertexSrc);
+    gl.compileShader(vertexShader);
+
+    if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
+      throw new Error(
+        `Vertex shader error: ${gl.getShaderInfoLog(vertexShader)}`,
+      );
+    }
+
+    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER)!;
+    gl.shaderSource(fragmentShader, fragmentSrc);
+    gl.compileShader(fragmentShader);
+
+    if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
+      throw new Error(
+        `Fragment shader error: ${gl.getShaderInfoLog(fragmentShader)}`,
+      );
+    }
+
+    const program = gl.createProgram()!;
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(`Program link error: ${gl.getProgramInfoLog(program)}`);
+    }
+    const uniforms = new Map<string, WebGLUniformLocation>();
+    const numUniforms = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < numUniforms; i++) {
+      const info = gl.getActiveUniform(program, i);
+      if (info) {
+        const location = gl.getUniformLocation(program, info.name);
+        if (location) {
+          uniforms.set(info.name, location);
+        }
+      }
+    }
+    const attributes = new Map<string, number>();
+    const numAttribs = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+    for (let i = 0; i < numAttribs; i++) {
+      const info = gl.getActiveAttrib(program, i);
+      if (info) {
+        attributes.set(info.name, gl.getAttribLocation(program, info.name));
+      }
+    }
+
+    this.shaders.set(name, { program, uniforms, attributes });
+
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+  }
+
+  async applyEffects(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<FilterResult> {
+    const startTime = performance.now();
+    const enabledEffects = effects.filter((e) => e.enabled);
+    if (enabledEffects.length === 0) {
+      return {
+        image: await createImageBitmap(image),
+        processingTime: performance.now() - startTime,
+        gpuAccelerated: false,
+      };
+    }
+
+    // Use CPU processing (Canvas2D filters) - reliable and fast for most effects
+    // WebGPU effects pipeline has rendering issues, using CPU for now
+    const result = await this.applyEffectsCPU(image, enabledEffects);
+    return {
+      image: result,
+      processingTime: performance.now() - startTime,
+      gpuAccelerated: false,
+    };
+  }
+
+  private async _applyEffectsWithNewRenderer(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<ImageBitmap> {
+    if (!this.renderer) {
+      throw new Error("Renderer not initialized");
+    }
+
+    try {
+      const texture = this.renderer.createTextureFromImage(image);
+      const processedTexture = this.renderer.applyEffects(texture, effects);
+
+      this.renderer.beginFrame();
+      this.renderer.renderLayer({
+        texture: processedTexture,
+        transform: {
+          position: { x: 0, y: 0 },
+          scale: { x: 1, y: 1 },
+          rotation: 0,
+          opacity: 1,
+          anchor: { x: 0.5, y: 0.5 },
+        },
+        effects: [],
+        opacity: 1,
+        borderRadius: 0,
+      });
+      const result = await this.renderer.endFrame();
+
+      this.renderer.releaseTexture(texture);
+
+      if (!result || result.width === 0 || result.height === 0) {
+        console.warn(
+          "[VideoEffectsEngine] Renderer returned invalid result, using CPU fallback",
+        );
+        return this.applyEffectsCPU(image, effects);
+      }
+
+      return result;
+    } catch (error) {
+      console.warn(
+        "[VideoEffectsEngine] applyEffectsWithNewRenderer failed:",
+        error,
+      );
+      return this.applyEffectsCPU(image, effects);
+    }
+  }
+
+  private async _applyEffectsGPU(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<ImageBitmap> {
+    const gl = this.gl!;
+    if (gl.isContextLost()) {
+      console.warn(
+        "[VideoEffectsEngine] WebGL context lost, falling back to CPU",
+      );
+      return this.applyEffectsCPU(image, effects);
+    }
+
+    try {
+      // Resize canvas if needed to match input image
+      if (
+        this.canvas!.width !== image.width ||
+        this.canvas!.height !== image.height
+      ) {
+        this.canvas!.width = image.width;
+        this.canvas!.height = image.height;
+        this.width = image.width;
+        this.height = image.height;
+
+        // Recreate render textures with new size
+        for (let i = 0; i < 2; i++) {
+          gl.bindTexture(gl.TEXTURE_2D, this.renderTextures[i]);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            this.width,
+            this.height,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            null,
+          );
+        }
+      }
+
+      // Upload source image to texture
+      const sourceTexture = this.uploadTexture(image);
+      for (let i = 0; i < 2; i++) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffers[i]);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          this.renderTextures[i],
+          0,
+        );
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      let currentTexture = sourceTexture;
+      this.currentRenderTarget = 0;
+
+      // Apply effects in sequence using ping-pong framebuffers
+      // Each effect reads from currentTexture and writes to renderTextures[currentRenderTarget]
+      // Next effect uses that as input, avoiding read-write conflicts
+      for (const effect of effects) {
+        const filterType = effect.type as FilterType;
+        const shader = this.getShader(filterType);
+
+        if (!shader) {
+          continue;
+        }
+
+        // Render effect: read from currentTexture, write to renderTextures[currentRenderTarget]
+        this.renderWithShader(filterType, currentTexture, effect.params);
+
+        // Ping-pong: next iteration reads from texture we just wrote to
+        // Toggle between framebuffers[0]/[1] to avoid reading while writing
+        currentTexture = this.renderTextures[this.currentRenderTarget];
+        this.currentRenderTarget = 1 - this.currentRenderTarget;
+      }
+
+      // Final pass: render result to screen (unbind framebuffer)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.width, this.height);
+      this.renderPassthrough(currentTexture);
+
+      // Clean up source texture
+      gl.deleteTexture(sourceTexture);
+      const error = gl.getError();
+      if (error !== gl.NO_ERROR) {
+        console.warn("[VideoEffectsEngine] WebGL error:", error);
+        // Fall back to returning original image
+        return createImageBitmap(image);
+      }
+      return createImageBitmap(this.canvas!);
+    } catch (error) {
+      console.error("[VideoEffectsEngine] GPU processing failed:", error);
+      // Fall back to CPU processing
+      return this.applyEffectsCPU(image, effects);
+    }
+  }
+
+  private uploadTexture(image: ImageBitmap): WebGLTexture {
+    const gl = this.gl!;
+    const texture = gl.createTexture()!;
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    return texture;
+  }
+
+  private renderWithShader(
+    filterType: FilterType,
+    texture: WebGLTexture,
+    params: Record<string, unknown>,
+  ): void {
+    const gl = this.gl!;
+    const shader = this.getShader(filterType);
+    if (!shader) return;
+    gl.bindFramebuffer(
+      gl.FRAMEBUFFER,
+      this.framebuffers[this.currentRenderTarget],
+    );
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.renderTextures[this.currentRenderTarget],
+      0,
+    );
+    gl.viewport(0, 0, this.width, this.height);
+
+    gl.useProgram(shader.program);
+
+    // Bind texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    const texLoc = shader.uniforms.get("u_texture");
+    if (texLoc) gl.uniform1i(texLoc, 0);
+    this.setFilterUniforms(filterType, shader, params);
+    this.setupVertexAttributes(shader);
+
+    // Draw
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  private renderPassthrough(texture: WebGLTexture): void {
+    const gl = this.gl!;
+    const shader = this.getShader("passthrough")!;
+
+    gl.useProgram(shader.program);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    const texLoc = shader.uniforms.get("u_texture");
+    if (texLoc) gl.uniform1i(texLoc, 0);
+
+    this.setupVertexAttributes(shader);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  private setupVertexAttributes(shader: ShaderProgram): void {
+    const gl = this.gl!;
+
+    const posLoc = shader.attributes.get("a_position");
+    if (posLoc !== undefined) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+
+    const texCoordLoc = shader.attributes.get("a_texCoord");
+    if (texCoordLoc !== undefined) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+      gl.enableVertexAttribArray(texCoordLoc);
+      gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+  }
+
+  private setFilterUniforms(
+    filterType: FilterType,
+    shader: ShaderProgram,
+    params: Record<string, unknown>,
+  ): void {
+    const gl = this.gl!;
+
+    switch (filterType) {
+      case "brightness": {
+        const loc = shader.uniforms.get("u_brightness");
+        if (loc) gl.uniform1f(loc, readEffectNumber(params.value, 0));
+        break;
+      }
+      case "contrast": {
+        const loc = shader.uniforms.get("u_contrast");
+        if (loc) gl.uniform1f(loc, readEffectNumber(params.value, 1));
+        break;
+      }
+      case "saturation": {
+        const loc = shader.uniforms.get("u_saturation");
+        if (loc) gl.uniform1f(loc, readEffectNumber(params.value, 1));
+        break;
+      }
+      case "hue": {
+        const loc = shader.uniforms.get("u_hueRotation");
+        if (loc) gl.uniform1f(loc, readEffectNumber(params.rotation, 0));
+        break;
+      }
+      case "blur": {
+        const radiusLoc = shader.uniforms.get("u_radius");
+        const resLoc = shader.uniforms.get("u_resolution");
+        if (radiusLoc)
+          gl.uniform1f(radiusLoc, Math.min(readEffectNumber(params.radius, 0), 10));
+        if (resLoc) gl.uniform2f(resLoc, this.width, this.height);
+        break;
+      }
+      case "sharpen": {
+        const amountLoc = shader.uniforms.get("u_amount");
+        const resLoc = shader.uniforms.get("u_resolution");
+        if (amountLoc) gl.uniform1f(amountLoc, readEffectNumber(params.amount, 0));
+        if (resLoc) gl.uniform2f(resLoc, this.width, this.height);
+        break;
+      }
+
+      case "vignette": {
+        const amountLoc = shader.uniforms.get("u_amount");
+        const midpointLoc = shader.uniforms.get("u_midpoint");
+        const featherLoc = shader.uniforms.get("u_feather");
+        const roundLoc = shader.uniforms.get("u_roundness");
+        const aspectLoc = shader.uniforms.get("u_aspect");
+        if (roundLoc)
+          gl.uniform1f(roundLoc, Math.min(1, Math.max(0, readEffectNumber(params.roundness, 0.5))));
+        if (aspectLoc) gl.uniform1f(aspectLoc, this.width / Math.max(1, this.height));
+        if (amountLoc)
+          gl.uniform1f(amountLoc, readEffectNumber(params.amount, 0));
+        if (midpointLoc)
+          gl.uniform1f(midpointLoc, readEffectNumber(params.midpoint, 0.5));
+        if (featherLoc)
+          gl.uniform1f(featherLoc, readEffectNumber(params.feather, 0.3));
+        break;
+      }
+      case "grain": {
+        const amountLoc = shader.uniforms.get("u_amount");
+        const sizeLoc = shader.uniforms.get("u_size");
+        const timeLoc = shader.uniforms.get("u_time");
+        if (amountLoc)
+          gl.uniform1f(amountLoc, readEffectNumber(params.amount, 0));
+        if (sizeLoc) gl.uniform1f(sizeLoc, readEffectNumber(params.size, 1));
+        if (timeLoc) gl.uniform1f(timeLoc, performance.now() / 1000);
+        break;
+      }
+      case "chromaKey": {
+        const keyColorLoc = shader.uniforms.get("u_keyColor");
+        const toleranceLoc = shader.uniforms.get("u_tolerance");
+        const softnessLoc = shader.uniforms.get("u_softness");
+        const keyColor = params.keyColor as
+          | { r: number; g: number; b: number }
+          | undefined;
+        if (keyColorLoc) {
+          gl.uniform3f(
+            keyColorLoc,
+            keyColor?.r ?? 0,
+            keyColor?.g ?? 1,
+            keyColor?.b ?? 0,
+          );
+        }
+        if (toleranceLoc)
+          gl.uniform1f(toleranceLoc, readEffectNumber(params.tolerance, 0.3));
+        if (softnessLoc)
+          gl.uniform1f(softnessLoc, readEffectNumber(params.edgeSoftness, 0.1));
+        break;
+      }
+      // Color grading filters
+      case "temperature": {
+        const tempLoc = shader.uniforms.get("u_temperature");
+        if (tempLoc) gl.uniform1f(tempLoc, readEffectNumber(params.value, 0));
+        break;
+      }
+      case "tint": {
+        const tintLoc = shader.uniforms.get("u_tint");
+        if (tintLoc) gl.uniform1f(tintLoc, readEffectNumber(params.value, 0));
+        break;
+      }
+      case "tonal": {
+        const shadowsLoc = shader.uniforms.get("u_shadows");
+        const midtonesLoc = shader.uniforms.get("u_midtones");
+        const highlightsLoc = shader.uniforms.get("u_highlights");
+        if (shadowsLoc)
+          gl.uniform1f(shadowsLoc, readEffectNumber(params.shadows, 0));
+        if (midtonesLoc)
+          gl.uniform1f(midtonesLoc, readEffectNumber(params.midtones, 0));
+        if (highlightsLoc)
+          gl.uniform1f(highlightsLoc, readEffectNumber(params.highlights, 0));
+        break;
+      }
+    }
+  }
+
+  /**
+   * Applies effects using Canvas 2D CPU rendering (fallback from GPU).
+   * Optimization: Split effects into two categories:
+   * 1. CSS filters (brightness, contrast, hue, blur, saturate): hardware-accelerated by browsers
+   * 2. Pixel-level effects (sharpen, vignette, grain, chroma-key): require manual pixel manipulation
+   *
+   * This avoids manual pixel manipulation for simple effects while supporting complex ones.
+   * CSS filters are chained in one drawImage call for efficiency.
+   */
+  private getFxContext(
+    width: number,
+    height: number,
+  ): OffscreenCanvasRenderingContext2D {
+    if (
+      !this._fxCanvas ||
+      !this._fxCtx ||
+      VideoEffectsEngine.needsResize(this._fxCanvas, width, height)
+    ) {
+      const canvas = this._fxCanvas ?? new OffscreenCanvas(width, height);
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
+        throw new Error("Failed to acquire 2D context for CPU effects");
+      }
+      this._fxCanvas = canvas;
+      this._fxCtx = ctx;
+    }
+
+    return this._fxCtx;
+  }
+
+  private getFxScratchContext(
+    width: number,
+    height: number,
+  ): OffscreenCanvasRenderingContext2D {
+    if (
+      !this._fxScratchCanvas ||
+      !this._fxScratchCtx ||
+      VideoEffectsEngine.needsResize(this._fxScratchCanvas, width, height)
+    ) {
+      const canvas = this._fxScratchCanvas ?? new OffscreenCanvas(width, height);
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
+        throw new Error("Failed to acquire scratch context for ordered effects");
+      }
+      this._fxScratchCanvas = canvas;
+      this._fxScratchCtx = ctx;
+    }
+    return this._fxScratchCtx;
+  }
+
+  static needsResize(
+    canvas: OffscreenCanvas,
+    width: number,
+    height: number,
+  ): boolean {
+    return canvas.width !== width || canvas.height !== height;
+  }
+
+  private categorizeEffects(effects: Effect[]): {
+    cssFilters: string[];
+    pixelEffects: Effect[];
+  } {
+    const cssFilters: string[] = [];
+    const pixelEffects: Effect[] = [];
+
+    for (const effect of effects) {
+      const filterString = this.buildCSSFilter(effect);
+      if (filterString) {
+        cssFilters.push(filterString);
+      } else {
+        pixelEffects.push(effect);
+      }
+    }
+
+    return { cssFilters, pixelEffects };
+  }
+
+  hasPixelLevelEffects(effects: Effect[]): boolean {
+    for (const effect of effects) {
+      if (!this.buildCSSFilter(effect)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  getCssFilterString(effects: Effect[]): string | null {
+    const enabledEffects = effects.filter((effect) => effect.enabled);
+    const { cssFilters, pixelEffects } = this.categorizeEffects(enabledEffects);
+    if (pixelEffects.length > 0) {
+      return null;
+    }
+    if (cssFilters.length === 0) {
+      return null;
+    }
+    return cssFilters.join(" ");
+  }
+
+  private static isShaderEffect(effect: Effect): boolean {
+    return effect.type === "shader";
+  }
+
+  private resolveShaderEffect(effect: Effect): ResolvedShaderEffect | null {
+    if (!VideoEffectsEngine.isShaderEffect(effect)) return null;
+    const params = effect.params as Record<string, unknown>;
+    const shaderId = params.shaderId;
+    if (typeof shaderId !== "string" || shaderId.length === 0) return null;
+    const def = getMotionShaderDef(shaderId);
+    if (!def || def.category !== "effect") return null;
+
+    const resolvedParams: Record<string, number | string> = {};
+    for (const paramDef of def.params) {
+      const value = readShaderParamValue(params[paramDef.name]);
+      resolvedParams[paramDef.name] =
+        value === undefined ? paramDef.default : value;
+    }
+
+    return { def, params: resolvedParams, time: readShaderTime(params) };
+  }
+
+  private applyShaderEffect(
+    ctx: OffscreenCanvasRenderingContext2D,
+    canvas: OffscreenCanvas,
+    resolved: ResolvedShaderEffect,
+    width: number,
+    height: number,
+  ): void {
+    if (!MotionShaderRenderer.isSupported()) return;
+    if (!this._shaderRenderer) {
+      this._shaderRenderer = new MotionShaderRenderer();
+    }
+    if (
+      !this._shaderAlphaCanvas ||
+      !this._shaderAlphaCtx ||
+      VideoEffectsEngine.needsResize(this._shaderAlphaCanvas, width, height)
+    ) {
+      const alphaCanvas =
+        this._shaderAlphaCanvas ?? new OffscreenCanvas(width, height);
+      alphaCanvas.width = width;
+      alphaCanvas.height = height;
+      const alphaCtx = alphaCanvas.getContext("2d");
+      if (!alphaCtx) return;
+      this._shaderAlphaCanvas = alphaCanvas;
+      this._shaderAlphaCtx = alphaCtx;
+    }
+    const alphaCtx = this._shaderAlphaCtx;
+    alphaCtx.save();
+    alphaCtx.setTransform(1, 0, 0, 1, 0, 0);
+    alphaCtx.globalCompositeOperation = "copy";
+    alphaCtx.filter = "none";
+    alphaCtx.drawImage(canvas, 0, 0, width, height);
+    alphaCtx.restore();
+    const result = this._shaderRenderer.render(resolved.def, {
+      width,
+      height,
+      time: resolved.time,
+      params: resolved.params,
+      inputCanvas: canvas,
+    });
+    if (!result) return;
+    ctx.save();
+    ctx.filter = "none";
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(result, 0, 0, width, height);
+    ctx.globalCompositeOperation = "destination-in";
+    ctx.drawImage(this._shaderAlphaCanvas, 0, 0, width, height);
+    ctx.restore();
+  }
+
+  private async renderEffectsOntoFxCanvas(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<OffscreenCanvas> {
+    const width = image.width;
+    const height = image.height;
+    const ctx = this.getFxContext(width, height);
+
+    ctx.filter = "none";
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0);
+
+    // Preserve authored stack order. Adjacent CSS filters may be safely fused,
+    // but pixel and shader passes form ordering boundaries and must see the
+    // output of every preceding effect.
+    let pendingCssFilters: string[] = [];
+    const flushCssFilters = (): void => {
+      if (pendingCssFilters.length === 0) return;
+      this.applyCssFilterBatch(ctx, pendingCssFilters, width, height);
+      pendingCssFilters = [];
+    };
+
+    for (const effect of effects) {
+      if (isPluginEffectType(effect.type)) {
+        // Third-party plugin: sandboxed host. Never throws; a failing plugin is bypassed.
+        flushCssFilters();
+        await getPluginHost().applyToContext(ctx, effect, width, height);
+        continue;
+      }
+      const cssFilter = this.buildCSSFilter(effect);
+      if (cssFilter) {
+        pendingCssFilters.push(cssFilter);
+        continue;
+      }
+
+      flushCssFilters();
+      if (VideoEffectsEngine.isShaderEffect(effect)) {
+        const resolved = this.resolveShaderEffect(effect);
+        if (resolved) {
+          this.applyShaderEffect(ctx, ctx.canvas, resolved, width, height);
+        }
+      } else {
+        await this.applyEffectPixelLevel(ctx, effect, width, height);
+      }
+    }
+    flushCssFilters();
+
+    return ctx.canvas;
+  }
+
+  private applyCssFilterBatch(
+    ctx: OffscreenCanvasRenderingContext2D,
+    filters: readonly string[],
+    width: number,
+    height: number,
+  ): void {
+    const scratch = this.getFxScratchContext(width, height);
+    scratch.save();
+    scratch.setTransform(1, 0, 0, 1, 0, 0);
+    scratch.globalCompositeOperation = "copy";
+    scratch.filter = filters.join(" ");
+    scratch.drawImage(ctx.canvas, 0, 0, width, height);
+    scratch.restore();
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "copy";
+    ctx.filter = "none";
+    ctx.drawImage(scratch.canvas, 0, 0, width, height);
+    ctx.restore();
+  }
+
+  private async applyEffectsCPU(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<ImageBitmap> {
+    const canvas = await this.renderEffectsOntoFxCanvas(image, effects);
+    return createImageBitmap(canvas);
+  }
+
+  async applyEffectsToCanvas(
+    image: ImageBitmap,
+    effects: Effect[],
+  ): Promise<OffscreenCanvas | null> {
+    const enabledEffects = effects.filter((e) => e.enabled);
+    if (enabledEffects.length === 0) {
+      return null;
+    }
+    return this.renderEffectsOntoFxCanvas(image, enabledEffects);
+  }
+
+  private async applyEffectPixelLevel(
+    ctx: OffscreenCanvasRenderingContext2D,
+    effect: Effect,
+    width: number,
+    height: number,
+  ): Promise<void> {
+    const params = effect.params as Record<string, unknown>;
+    if (effect.type === "mask" && applyIrisMaskToContext(ctx, params, width, height)) return;
+    if (isBurnInEffectType(effect.type)) {
+      // Text burn-ins (timecode, names) are drawn with Canvas2D on every path; the text was resolved per frame.
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      drawBurnIn(ctx, effect.type, params, width, height);
+      ctx.restore();
+      return;
+    }
+    if (isProEffectType(effect.type)) {
+      // The VR effects' CPU reference and GLSL are a lazy chunk (vr-runtime-loader.ts). Every render path, preview,
+      // render cache and export alike, runs through this async pass, so the first VR frame waits for the load
+      // instead of being drawn without the effect.
+      if (!isVrRuntimeLoaded() && isVrEffectType(effect.type)) await loadVrRuntime();
+      this.applyProEffectToContext(ctx, effect.type, params, width, height);
+      return;
+    }
+    if (effect.type === "glow") {
+      this.applyGlowToContext(ctx, params, width, height);
+      return;
+    }
+    if (effect.type === "shadow") {
+      this.applyShadowToContext(ctx, params, width, height);
+      return;
+    }
+    if (
+      (effect.type === "grain" || effect.type === "vignette" || effect.type === "sharpen") &&
+      readEffectNumber(params.amount, 0) === 0
+    ) return;
+
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+
+    switch (effect.type) {
+      case "sharpen": {
+        const amount = readEffectNumber(params.amount, 0);
+        this.applySharpenKernel(data, width, height, amount);
+        break;
+      }
+      case "vignette": {
+        const vigAmount = readEffectNumber(params.amount, 0);
+        const midpoint = readEffectNumber(params.midpoint, 0.5);
+        const feather = readEffectNumber(params.feather, 0.3);
+        const roundness = readEffectNumber(params.roundness, 0.5);
+        this.applyVignette(data, width, height, vigAmount, midpoint, feather, roundness);
+        break;
+      }
+      case "grain": {
+        const grainAmount = readEffectNumber(params.amount, 0);
+        this.applyGrain(data, grainAmount);
+        break;
+      }
+      case "chromaKey": {
+        const keyColor = params.keyColor as
+          | { r: number; g: number; b: number }
+          | undefined;
+        const tolerance = readEffectNumber(params.tolerance, 0.3);
+        const softness = readEffectNumber(params.edgeSoftness, 0.1);
+        this.applyChromaKey(
+          data,
+          keyColor || { r: 0, g: 1, b: 0 },
+          tolerance,
+          softness,
+        );
+        break;
+      }
+      // Color grading filters
+      case "temperature": {
+        const temperature = readEffectNumber(params.value, 0);
+        this.applyTemperature(data, temperature);
+        break;
+      }
+      case "tint": {
+        const tint = readEffectNumber(params.value, 0);
+        this.applyTint(data, tint);
+        break;
+      }
+      case "tonal": {
+        const shadows = readEffectNumber(params.shadows, 0);
+        const midtones = readEffectNumber(params.midtones, 0);
+        const highlights = readEffectNumber(params.highlights, 0);
+        this.applyTonal(data, shadows, midtones, highlights);
+        break;
+      }
+      case "motion-blur": {
+        const distance = readEffectNumber(params.distance, 0);
+        const angle = readEffectNumber(params.angle, 0);
+        this.applyMotionBlur(data, width, height, distance, angle);
+        break;
+      }
+      case "radial-blur": {
+        const amount = readEffectNumber(params.amount, 0);
+        const centerX = readEffectNumber(params.centerX, 50);
+        const centerY = readEffectNumber(params.centerY, 50);
+        this.applyRadialBlur(data, width, height, amount, centerX, centerY);
+        break;
+      }
+      case "chromatic-aberration": {
+        const amount = readEffectNumber(params.amount, 0);
+        this.applyChromaticAberration(data, width, height, amount);
+        break;
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  /**
+   * Drop shadow. A shadow only exists where the layer's alpha does not cover,
+   * so on an opaque full-frame video the old CSS `drop-shadow` painted
+   * entirely outside the frame and changed nothing. When the frame is opaque
+   * the picture is inset as a card (just enough to fit the shadow) and the
+   * shadow is cast onto the margin; frames that already carry transparency
+   * (a feathered crop, a keyed clip, an image with alpha) are shadowed at
+   * full size.
+   */
+  private applyShadowToContext(
+    ctx: OffscreenCanvasRenderingContext2D,
+    params: Record<string, unknown>,
+    width: number,
+    height: number,
+  ): void {
+    const offsetX = readEffectNumber(params.offsetX, 0);
+    const offsetY = readEffectNumber(params.offsetY, 0);
+    const blur = Math.max(0, readEffectNumber(params.blur, 0));
+    const opacity = typeof params.opacity === "number" ? params.opacity : 0.8;
+    if (opacity <= 0 || (offsetX === 0 && offsetY === 0 && blur === 0)) return;
+    const color = this.toFilterColor(
+      typeof params.color === "string" ? params.color : undefined,
+      opacity,
+    );
+
+    const probes: ReadonlyArray<readonly [number, number]> = [
+      [0, 0],
+      [width - 1, 0],
+      [0, height - 1],
+      [width - 1, height - 1],
+      [Math.floor(width / 2), 0],
+      [Math.floor(width / 2), height - 1],
+      [0, Math.floor(height / 2)],
+      [width - 1, Math.floor(height / 2)],
+    ];
+    const opaque = probes.every(
+      ([x, y]) => ctx.getImageData(x, y, 1, 1).data[3] === 255,
+    );
+
+    const scratch = this.getFxScratchContext(width, height);
+    scratch.save();
+    scratch.setTransform(1, 0, 0, 1, 0, 0);
+    scratch.filter = "none";
+    scratch.globalCompositeOperation = "copy";
+    scratch.drawImage(ctx.canvas, 0, 0, width, height);
+    scratch.restore();
+
+    let margin = 0;
+    if (opaque) {
+      const cap = Math.floor(Math.min(width, height) * 0.15);
+      margin = Math.max(
+        4,
+        Math.min(cap, Math.ceil(blur + Math.max(Math.abs(offsetX), Math.abs(offsetY))) + 2),
+      );
+    }
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.filter = "none";
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.clearRect(0, 0, width, height);
+    ctx.shadowColor = color;
+    ctx.shadowOffsetX = offsetX;
+    ctx.shadowOffsetY = offsetY;
+    ctx.shadowBlur = blur;
+    ctx.drawImage(
+      scratch.canvas,
+      margin,
+      margin,
+      width - margin * 2,
+      height - margin * 2,
+    );
+    ctx.restore();
+  }
+
+  /**
+   * In-frame bloom. The previous implementation was a CSS `drop-shadow` halo,
+   * which only paints outside the alpha silhouette and therefore changed
+   * nothing on an opaque video frame. This blurs a contrast-boosted copy
+   * (so highlights dominate), optionally tints it, and screen-blends it back,
+   * which brightens and softens highlights in-frame and still leaves a halo
+   * around transparent regions.
+   */
+  private applyGlowToContext(
+    ctx: OffscreenCanvasRenderingContext2D,
+    params: Record<string, unknown>,
+    width: number,
+    height: number,
+  ): void {
+    const radius = Math.max(0, Math.min(100, readEffectNumber(params.radius, 0)));
+    const intensity = Math.max(0, Math.min(3, readEffectNumber(params.intensity, 1)));
+    if (radius <= 0 || intensity <= 0) return;
+    const color = typeof params.color === "string" ? params.color : "#ffffff";
+    const tinted = !/^#?f{3}(f{3})?$/i.test(color.trim());
+
+    const scratch = this.getFxScratchContext(width, height);
+    scratch.save();
+    scratch.setTransform(1, 0, 0, 1, 0, 0);
+    scratch.globalCompositeOperation = "copy";
+    scratch.filter = `blur(${radius}px) brightness(1.25) contrast(1.5)`;
+    scratch.drawImage(ctx.canvas, 0, 0, width, height);
+    scratch.filter = "none";
+    if (tinted) {
+      scratch.globalCompositeOperation = "multiply";
+      scratch.fillStyle = color;
+      scratch.fillRect(0, 0, width, height);
+      // multiply over transparent pixels would paint opaque colour; restore
+      // the blurred silhouette.
+      scratch.globalCompositeOperation = "destination-in";
+      scratch.filter = `blur(${radius}px)`;
+      scratch.drawImage(ctx.canvas, 0, 0, width, height);
+    }
+    scratch.restore();
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.filter = "none";
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = Math.min(1, 0.6 * intensity);
+    ctx.drawImage(scratch.canvas, 0, 0, width, height);
+    ctx.restore();
+  }
+
+  /**
+   * Pro effects run as WebGL2 fragment shaders when available (real time) and
+   * fall back to the CPU reference implementation otherwise. Neutral params
+   * are an exact no-op with no readback or GPU work on either path.
+   */
+  private applyProEffectToContext(
+    ctx: OffscreenCanvasRenderingContext2D,
+    type: ProEffectType,
+    params: Record<string, unknown>,
+    width: number,
+    height: number,
+  ): void {
+    // Echo / Posterize Time pick source frames upstream (VideoEngine); there is nothing to draw per pixel.
+    if (isTemporalEffectType(type)) return;
+    if (isProEffectNeutral(type, params)) return;
+    if (this.applyProEffectGpu(ctx, type, params, width, height)) return;
+    const imageData = ctx.getImageData(0, 0, width, height);
+    applyProEffect(type, params, imageData.data, width, height);
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  private applyProEffectGpu(
+    ctx: OffscreenCanvasRenderingContext2D,
+    type: ProEffectType,
+    params: Record<string, unknown>,
+    width: number,
+    height: number,
+  ): boolean {
+    if (!this.useGPU || this._proGpuFailed.has(type)) return false;
+    if (VideoEffectsEngine._proGpuSupported === null) {
+      VideoEffectsEngine._proGpuSupported = MotionShaderRenderer.isSupported();
+    }
+    if (!VideoEffectsEngine._proGpuSupported) return false;
+    if (!this._shaderRenderer) this._shaderRenderer = new MotionShaderRenderer();
+    const result = this._shaderRenderer.render(PRO_EFFECT_SHADER_DEFS[type], {
+      width,
+      height,
+      time: 0,
+      params: proEffectGpuUniforms(type, params, height),
+      inputCanvas: ctx.canvas,
+      strict: true,
+    });
+    if (!result) {
+      this._proGpuFailed.add(type);
+      return false;
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "copy";
+    ctx.filter = "none";
+    ctx.drawImage(result, 0, 0, width, height);
+    ctx.restore();
+    return true;
+  }
+
+  private applySharpenKernel(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    amount: number,
+  ): void {
+    const normalizedAmount = amount / 100;
+    const copy = new Uint8ClampedArray(data);
+    const kernel = [
+      0,
+      -normalizedAmount,
+      0,
+      -normalizedAmount,
+      1 + 4 * normalizedAmount,
+      -normalizedAmount,
+      0,
+      -normalizedAmount,
+      0,
+    ];
+
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        for (let c = 0; c < 3; c++) {
+          let sum = 0;
+          for (let ky = -1; ky <= 1; ky++) {
+            for (let kx = -1; kx <= 1; kx++) {
+              const idx = ((y + ky) * width + (x + kx)) * 4 + c;
+              sum += copy[idx] * kernel[(ky + 1) * 3 + (kx + 1)];
+            }
+          }
+          data[(y * width + x) * 4 + c] = Math.max(0, Math.min(255, sum));
+        }
+      }
+    }
+  }
+
+  private applyVignette(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    amount: number,
+    midpoint: number,
+    feather: number,
+    roundness = 0.5,
+  ): void {
+    const normalizedAmount = amount / 100;
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const half = Math.max(centerX, centerY);
+    const round = Math.min(1, Math.max(0, roundness));
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const dx = (x - centerX) / centerX;
+        const dy = (y - centerY) / centerY;
+        // 0.5 keeps the frame-following oval; 0 squares it off, 1 makes it a circle.
+        const oval = Math.sqrt(dx * dx + dy * dy) / Math.SQRT2;
+        let dist = oval;
+        if (round < 0.5) {
+          const box = Math.max(Math.abs(dx), Math.abs(dy));
+          dist = box + (oval - box) * (round / 0.5);
+        } else if (round > 0.5) {
+          const cx = (x - centerX) / half;
+          const cy = (y - centerY) / half;
+          const circle = Math.sqrt(cx * cx + cy * cy) / Math.SQRT2;
+          dist = oval + (circle - oval) * ((round - 0.5) / 0.5);
+        }
+
+        const vignette = this.smoothstep(
+          midpoint - feather,
+          midpoint + feather,
+          dist,
+        );
+        const factor = 1 - vignette * normalizedAmount;
+
+        const idx = (y * width + x) * 4;
+        data[idx] = Math.round(data[idx] * factor);
+        data[idx + 1] = Math.round(data[idx + 1] * factor);
+        data[idx + 2] = Math.round(data[idx + 2] * factor);
+      }
+    }
+  }
+
+  private smoothstep(edge0: number, edge1: number, x: number): number {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+  }
+
+  private applyGrain(data: Uint8ClampedArray, amount: number): void {
+    const normalizedAmount = amount / 100;
+    const intensity = normalizedAmount * 50;
+    for (let i = 0; i < data.length; i += 4) {
+      const noise = (Math.random() - 0.5) * intensity;
+      data[i] = Math.max(0, Math.min(255, data[i] + noise));
+      data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise));
+      data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise));
+    }
+  }
+
+  private applyChromaKey(
+    data: Uint8ClampedArray,
+    keyColor: { r: number; g: number; b: number },
+    tolerance: number,
+    softness: number,
+  ): void {
+    const keyR = keyColor.r * 255;
+    const keyG = keyColor.g * 255;
+    const keyB = keyColor.b * 255;
+    const tolDist = tolerance * 441.67; // sqrt(255^2 * 3)
+    const softDist = softness * 441.67;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const dr = data[i] - keyR;
+      const dg = data[i + 1] - keyG;
+      const db = data[i + 2] - keyB;
+      const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+
+      const alpha = this.smoothstep(
+        tolDist - softDist,
+        tolDist + softDist,
+        dist,
+      );
+      data[i + 3] = Math.round(data[i + 3] * alpha);
+    }
+  }
+
+  /**
+   * Temperature and tint are per-channel functions of one byte each: the 256 results are computed once with the
+   * original expressions and the pixel loop is three table reads (the former per-pixel Math.min/max/round chain
+   * was the preview's second-largest CPU stage after the LUT).
+   */
+  private applyTemperature(data: Uint8ClampedArray, temperature: number): void {
+    const normalizedTemp = temperature / 100;
+    const rTable = new Uint8Array(256);
+    const gTable = new Uint8Array(256);
+    const bTable = new Uint8Array(256);
+    for (let v = 0; v < 256; v++) {
+      let r = v;
+      let g = v;
+      let b = v;
+      if (normalizedTemp > 0) {
+        r = Math.min(255, r + normalizedTemp * 51);
+        g = Math.min(255, g + normalizedTemp * 25.5);
+        b = Math.max(0, b - normalizedTemp * 51);
+      } else {
+        r = Math.max(0, r + normalizedTemp * 51);
+        g = Math.max(0, g + normalizedTemp * 12.75);
+        b = Math.min(255, b - normalizedTemp * 51);
+      }
+      rTable[v] = Math.round(r);
+      gTable[v] = Math.round(g);
+      bTable[v] = Math.round(b);
+    }
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = rTable[data[i]];
+      data[i + 1] = gTable[data[i + 1]];
+      data[i + 2] = bTable[data[i + 2]];
+    }
+  }
+
+  private applyTint(data: Uint8ClampedArray, tint: number): void {
+    const normalizedTint = tint / 100;
+    const rTable = new Uint8Array(256);
+    const gTable = new Uint8Array(256);
+    const bTable = new Uint8Array(256);
+    for (let v = 0; v < 256; v++) {
+      rTable[v] = Math.round(Math.max(0, Math.min(255, v + normalizedTint * 25.5)));
+      gTable[v] = Math.round(Math.max(0, Math.min(255, v - normalizedTint * 51)));
+      bTable[v] = Math.round(Math.max(0, Math.min(255, v + normalizedTint * 25.5)));
+    }
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = rTable[data[i]];
+      data[i + 1] = gTable[data[i + 1]];
+      data[i + 2] = bTable[data[i + 2]];
+    }
+  }
+
+  private applyTonal(
+    data: Uint8ClampedArray,
+    shadows: number,
+    midtones: number,
+    highlights: number,
+  ): void {
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i] / 255;
+      const g = data[i + 1] / 255;
+      const b = data[i + 2] / 255;
+      const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+      const shadowWeight = 1 - this.smoothstep(0, 0.33, luma);
+      const highlightWeight = this.smoothstep(0.66, 1, luma);
+      const midtoneWeight = Math.max(0, 1 - shadowWeight - highlightWeight);
+      const adjustment =
+        shadows * shadowWeight * 0.3 +
+        midtones * midtoneWeight * 0.3 +
+        highlights * highlightWeight * 0.3;
+
+      data[i] = Math.round(Math.max(0, Math.min(255, (r + adjustment) * 255)));
+      data[i + 1] = Math.round(
+        Math.max(0, Math.min(255, (g + adjustment) * 255)),
+      );
+      data[i + 2] = Math.round(
+        Math.max(0, Math.min(255, (b + adjustment) * 255)),
+      );
+    }
+  }
+
+  private applyMotionBlur(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    distance: number,
+    angle: number,
+  ): void {
+    const blurDistance = Math.max(0, distance);
+    if (blurDistance <= 0) {
+      return;
+    }
+
+    const copy = new Uint8ClampedArray(data);
+    const sampleCount = Math.max(2, Math.min(16, Math.ceil(blurDistance / 4) + 1));
+    const radians = (angle * Math.PI) / 180;
+    const dirX = Math.cos(radians);
+    const dirY = Math.sin(radians);
+    const maxOffset = blurDistance / 2;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let alpha = 0;
+        let samples = 0;
+
+        for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
+          const t = sampleCount === 1 ? 0 : sampleIndex / (sampleCount - 1);
+          const offset = (t - 0.5) * 2 * maxOffset;
+          const sampleX = Math.round(x + dirX * offset);
+          const sampleY = Math.round(y + dirY * offset);
+
+          if (
+            sampleX < 0 ||
+            sampleX >= width ||
+            sampleY < 0 ||
+            sampleY >= height
+          ) {
+            continue;
+          }
+
+          const sampleOffset = (sampleY * width + sampleX) * 4;
+          red += copy[sampleOffset];
+          green += copy[sampleOffset + 1];
+          blue += copy[sampleOffset + 2];
+          alpha += copy[sampleOffset + 3];
+          samples += 1;
+        }
+
+        if (samples === 0) {
+          continue;
+        }
+
+        const pixelOffset = (y * width + x) * 4;
+        data[pixelOffset] = Math.round(red / samples);
+        data[pixelOffset + 1] = Math.round(green / samples);
+        data[pixelOffset + 2] = Math.round(blue / samples);
+        data[pixelOffset + 3] = Math.round(alpha / samples);
+      }
+    }
+  }
+
+  private applyRadialBlur(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    amount: number,
+    centerX: number,
+    centerY: number,
+  ): void {
+    const blurAmount = Math.max(0, amount);
+    if (blurAmount <= 0) {
+      return;
+    }
+
+    const copy = new Uint8ClampedArray(data);
+    const sampleCount = Math.max(2, Math.min(12, Math.ceil(blurAmount / 8) + 2));
+    const strength = Math.max(0, Math.min(1, blurAmount / 100));
+    const centerPixelX = (centerX / 100) * Math.max(0, width - 1);
+    const centerPixelY = (centerY / 100) * Math.max(0, height - 1);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const deltaX = x - centerPixelX;
+        const deltaY = y - centerPixelY;
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let alpha = 0;
+        let samples = 0;
+
+        for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
+          const t = sampleCount === 1 ? 0 : sampleIndex / (sampleCount - 1);
+          const scale = 1 + (t - 0.5) * strength * 1.5;
+          const sampleX = Math.round(centerPixelX + deltaX * scale);
+          const sampleY = Math.round(centerPixelY + deltaY * scale);
+
+          if (
+            sampleX < 0 ||
+            sampleX >= width ||
+            sampleY < 0 ||
+            sampleY >= height
+          ) {
+            continue;
+          }
+
+          const sampleOffset = (sampleY * width + sampleX) * 4;
+          red += copy[sampleOffset];
+          green += copy[sampleOffset + 1];
+          blue += copy[sampleOffset + 2];
+          alpha += copy[sampleOffset + 3];
+          samples += 1;
+        }
+
+        if (samples === 0) {
+          continue;
+        }
+
+        const pixelOffset = (y * width + x) * 4;
+        data[pixelOffset] = Math.round(red / samples);
+        data[pixelOffset + 1] = Math.round(green / samples);
+        data[pixelOffset + 2] = Math.round(blue / samples);
+        data[pixelOffset + 3] = Math.round(alpha / samples);
+      }
+    }
+  }
+
+  private applyChromaticAberration(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number,
+    amount: number,
+  ): void {
+    const offset = Math.max(0, Math.round(amount / 2));
+    if (offset <= 0) {
+      return;
+    }
+
+    const copy = new Uint8ClampedArray(data);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixelOffset = (y * width + x) * 4;
+        const redX = Math.min(width - 1, x + offset);
+        const blueX = Math.max(0, x - offset);
+        const redOffset = (y * width + redX) * 4;
+        const blueOffset = (y * width + blueX) * 4;
+
+        data[pixelOffset] = copy[redOffset];
+        data[pixelOffset + 1] = copy[pixelOffset + 1];
+        data[pixelOffset + 2] = copy[blueOffset + 2];
+        data[pixelOffset + 3] = copy[pixelOffset + 3];
+      }
+    }
+  }
+
+  private toFilterColor(color: string | undefined, opacity: number): string {
+    const alpha = Math.max(0, Math.min(1, opacity));
+    if (!color) {
+      return `rgba(0, 0, 0, ${alpha})`;
+    }
+
+    if (color.startsWith("rgb(" ) || color.startsWith("rgba(")) {
+      return color;
+    }
+
+    const normalized = color.replace(/^#/, "");
+    const hex =
+      normalized.length === 3
+        ? normalized
+            .split("")
+            .map((char) => `${char}${char}`)
+            .join("")
+        : normalized;
+
+    if (hex.length !== 6) {
+      return `rgba(0, 0, 0, ${alpha})`;
+    }
+
+    const red = Number.parseInt(hex.slice(0, 2), 16);
+    const green = Number.parseInt(hex.slice(2, 4), 16);
+    const blue = Number.parseInt(hex.slice(4, 6), 16);
+
+    if (Number.isNaN(red) || Number.isNaN(green) || Number.isNaN(blue)) {
+      return `rgba(0, 0, 0, ${alpha})`;
+    }
+
+    return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+  }
+
+  private buildCSSFilter(effect: Effect): string {
+    const params = effect.params as Record<string, number | string>;
+    const value = typeof params.value === "number" ? params.value : 0;
+
+    switch (effect.type) {
+      case "brightness":
+        return `brightness(${1 + value / 100})`;
+      case "contrast":
+        return `contrast(${readEffectNumber(params.value, 1)})`;
+      case "saturation":
+        return `saturate(${readEffectNumber(params.value, 1)})`;
+      case "grayscale":
+        return `grayscale(${readEffectNumber(params.amount, 1)})`;
+      case "sepia":
+        return `sepia(${readEffectNumber(params.amount, 1)})`;
+      case "invert":
+        return `invert(${readEffectNumber(params.amount, 1)})`;
+      case "hue":
+        return `hue-rotate(${readEffectNumber(params.rotation, 0)}deg)`;
+      case "blur":
+        return `blur(${readEffectNumber(params.radius, 0)}px)`;
+      default:
+        return "";
+    }
+  }
+
+  async applyEffect(image: ImageBitmap, effect: Effect): Promise<FilterResult> {
+    return this.applyEffects(image, [effect]);
+  }
+
+  removeEffect(effects: Effect[], effectId: string): Effect[] {
+    return effects.filter((e) => e.id !== effectId);
+  }
+
+  reorderEffects(
+    effects: Effect[],
+    fromIndex: number,
+    toIndex: number,
+  ): Effect[] {
+    const result = [...effects];
+    const [removed] = result.splice(fromIndex, 1);
+    result.splice(toIndex, 0, removed);
+    return result;
+  }
+
+  getEffectOrder(effects: Effect[]): string[] {
+    return effects.filter((e) => e.enabled).map((e) => e.id);
+  }
+
+  private static webgl2Supported: boolean | null = null;
+
+  static isWebGL2Supported(): boolean {
+    // Probed once per page, and the probe context is given back at once: it used to leak one live context per engine.
+    if (VideoEffectsEngine.webgl2Supported !== null) return VideoEffectsEngine.webgl2Supported;
+    try {
+      const canvas = new OffscreenCanvas(1, 1);
+      const gl = canvas.getContext("webgl2");
+      releaseGLContext(gl);
+      VideoEffectsEngine.webgl2Supported = gl !== null;
+    } catch {
+      VideoEffectsEngine.webgl2Supported = false;
+    }
+    return VideoEffectsEngine.webgl2Supported;
+  }
+
+  resize(width: number, height: number): void {
+    this.width = width;
+    this.height = height;
+
+    if (this.canvas) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
+
+    // Resize new renderer if available
+    if (this.renderer) {
+      this.renderer.resize(width, height);
+    }
+
+    // Resize legacy WebGL2 resources
+    if (this.gl) {
+      // Recreate render textures
+      for (const tex of this.renderTextures) {
+        this.gl.deleteTexture(tex);
+      }
+      this.renderTextures = [];
+
+      for (let i = 0; i < 2; i++) {
+        this.renderTextures.push(this.createRenderTexture());
+      }
+    }
+  }
+
+  getAvailableFilters(): FilterType[] {
+    return [
+      "brightness",
+      "contrast",
+      "saturation",
+      "hue",
+      "blur",
+      "sharpen",
+      "vignette",
+      "grain",
+      "chromaKey",
+      "temperature",
+      "tint",
+      "tonal",
+      "shadow",
+      "glow",
+      "motion-blur",
+      "radial-blur",
+      "chromatic-aberration",
+      ...PRO_EFFECT_TYPES,
+    ];
+  }
+
+  isFilterSupported(filterType: string): boolean {
+    return this.getAvailableFilters().includes(filterType as FilterType);
+  }
+
+  dispose(): void {
+    // Clean up new renderer
+    if (this.renderer) {
+      this.renderer.destroy();
+      this.renderer = null;
+    }
+    this.rendererFactory = null;
+    this.useNewRenderer = false;
+
+    // Clean up legacy WebGL2 resources
+    if (this.gl) {
+      for (const shader of this.shaders.values()) {
+        this.gl.deleteProgram(shader.program);
+      }
+      this.shaders.clear();
+      if (this.quadBuffer) this.gl.deleteBuffer(this.quadBuffer);
+      if (this.texCoordBuffer) this.gl.deleteBuffer(this.texCoordBuffer);
+      for (const fb of this.framebuffers) {
+        this.gl.deleteFramebuffer(fb);
+      }
+      for (const tex of this.renderTextures) {
+        this.gl.deleteTexture(tex);
+      }
+
+      this.framebuffers = [];
+      this.renderTextures = [];
+      releaseGLContext(this.gl);
+    }
+
+    if (this._shaderRenderer) {
+      this._shaderRenderer.dispose();
+      this._shaderRenderer = null;
+    }
+
+    this.canvas = null;
+    this.gl = null;
+    this._fxCanvas = null;
+    this._fxCtx = null;
+    this._fxScratchCanvas = null;
+    this._fxScratchCtx = null;
+    this._shaderAlphaCanvas = null;
+    this._shaderAlphaCtx = null;
+    this.initialized = false;
+  }
+
+  getRendererType(): string {
+    if (this.useNewRenderer && this.renderer) {
+      return this.renderer.type;
+    }
+    if (this.gl) {
+      return "legacy-webgl2";
+    }
+    return "cpu";
+  }
+
+  isUsingWebGPU(): boolean {
+    return this.useNewRenderer && this.renderer?.type === "webgpu";
+  }
+
+  getRenderer(): Renderer | null {
+    return this.renderer;
+  }
+}
+let videoEffectsEngineInstance: VideoEffectsEngine | null = null;
+
+export function getVideoEffectsEngine(
+  width: number = 1920,
+  height: number = 1080,
+): VideoEffectsEngine {
+  if (!videoEffectsEngineInstance) {
+    videoEffectsEngineInstance = new VideoEffectsEngine({ width, height });
+    videoEffectsEngineInstance.initialize().catch((error) => {
+      console.error(
+        "[VideoEffectsEngine] Background initialization failed:",
+        error,
+      );
+    });
+  } else if (
+    videoEffectsEngineInstance["width"] !== width ||
+    videoEffectsEngineInstance["height"] !== height
+  ) {
+    videoEffectsEngineInstance.resize(width, height);
+  }
+  return videoEffectsEngineInstance;
+}
