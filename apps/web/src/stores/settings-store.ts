@@ -16,6 +16,24 @@ interface ServiceConfig {
  */
 export const SERVICE_REGISTRY: readonly ServiceConfig[] = [
   {
+    id: "google-gemini",
+    label: "Google Gemini (AI Studio)",
+    description: "Chave gratuita ou paga da API Gemini para o assistente de edição",
+    docsUrl: "https://aistudio.google.com/apikey",
+  },
+  {
+    id: "groq",
+    label: "Groq",
+    description: "Inferência ultra-rápida gratuita/paga (Llama 3.3 70B) compatível com OpenAI",
+    docsUrl: "https://console.groq.com/keys",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    description: "Gateway unificado com dezenas de modelos gratuitos e pagos",
+    docsUrl: "https://openrouter.ai/keys",
+  },
+  {
     id: "elevenlabs",
     label: "ElevenLabs",
     description: "AI voice generation and text-to-speech",

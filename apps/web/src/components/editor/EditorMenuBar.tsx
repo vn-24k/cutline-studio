@@ -333,6 +333,14 @@ export function EditorMenuBar({
       { label: "Manage plugins…", description: "Install effect plugins (.orplugin)", action: () => usePluginManagerStore.getState().setOpen(true) },
     ],
     View: [
+      {
+        label: "Assistente IA",
+        action: () => ui().setPanelVisible("agentChat", true),
+      },
+      {
+        label: "Conectar APIs de IA…",
+        action: () => useEditorWorkspaceStore.getState().setAIConnectionOpen(true),
+      },
       { label: "Action history", action: () => ui().openModal("history") },
       {
         label: "Project JSON / comments",

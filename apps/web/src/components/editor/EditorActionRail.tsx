@@ -1,10 +1,12 @@
 import {
+  MessageSquare,
   Film,
   Music2,
   Type,
   Pencil,
   PanelsTopLeft,
   Shapes,
+  Sparkles,
   BookText,
   SlidersHorizontal,
   Bookmark,
@@ -33,6 +35,7 @@ const tools = [
   ["effects", "Effects", Pencil],
   ["transitions", "Transitions", PanelsTopLeft],
   ["graphics", "Graphics", Shapes],
+  ["ai", "Gerar & APIs", Sparkles],
   ["recipes", "Recipes", BookText],
   ["markers", "Markers", Bookmark],
   ["browser", "Media Browser", FolderSearch],
@@ -79,6 +82,13 @@ export function EditorActionRail() {
         className="workspace-rail"
       >
         <div className="workspace-rail-scroll" data-testid="workspace-rail-scroll">
+        {railButton(
+          "Assistente IA",
+          chatVisible,
+          () =>
+            useUIStore.getState().setPanelVisible("agentChat", !chatVisible),
+          <MessageSquare />,
+        )}
         {tools.map(([value, label, Icon]) =>
           railButton(
             label,

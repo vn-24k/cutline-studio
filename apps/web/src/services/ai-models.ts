@@ -59,6 +59,7 @@ export type AIProviderChoiceId =
   | "anthropic"
   | "openai"
   | "google"
+  | "groq"
   | "openrouter"
   | "custom";
 
@@ -117,10 +118,26 @@ export const AI_PROVIDER_CHOICES: readonly AIProviderChoice[] = [
     subtitle: "Gemini models",
     provider: "compatible",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    model: "",
+    model: "gemini-4-hydrogen",
     keyRequired: true,
     keyUrl: "https://aistudio.google.com/apikey",
-    models: [],
+    models: [
+      { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen (Grátis)", recommended: true },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    ],
+  },
+  {
+    id: "groq",
+    name: "Groq",
+    subtitle: "Llama & Mixtral ultra-rápido",
+    provider: "compatible",
+    baseUrl: "https://api.groq.com/openai/v1",
+    model: "llama-3.3-70b-versatile",
+    keyRequired: true,
+    keyUrl: "https://console.groq.com/keys",
+    models: [
+      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B", recommended: true },
+    ],
   },
   {
     id: "openrouter",

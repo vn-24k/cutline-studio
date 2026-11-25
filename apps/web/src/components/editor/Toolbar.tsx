@@ -2,6 +2,7 @@ import { useLatch } from "./use-latch";
 import { usePhoneEditor } from "../../hooks/usePhoneEditor";
 import { MobileEditorHeader } from "./mobile/MobileEditorHeader";
 import "./mobile/mobile-editor.css";
+import { useAIConnectionStore, isAIConnectionReady } from "../../stores/ai-connection-store";
 import { useEditorWorkspaceStore } from "../../stores/editor-workspace-store";
 import { DesktopExportButton } from "../../desktop/editor/DesktopExportButton";
 import { WindowControls } from "../../desktop/shell/WindowControls";
@@ -62,6 +63,7 @@ export const Toolbar: React.FC = () => {
     if (window.openreel?.platform === "desktop") window.dispatchEvent(new CustomEvent("openreel:menu:export"));
     else useUIStore.getState().openModal("export");
   }, []);
+  const aiMode = useUIStore((s) => s.panels.agentChat?.visible ?? false);
   const [isCompressOpen, setIsCompressOpen] = useState(false);
   // Dialogs are fetched the first time they open and then stay mounted so their close animation still plays.
   const aiConnectionOpen = useEditorWorkspaceStore((s) => s.aiConnectionOpen);
@@ -292,6 +294,11 @@ export const Toolbar: React.FC = () => {
         </Suspense>
       )}
       {phone ? <MobileEditorHeader
+        onAI={() => {
+          const c = useAIConnectionStore.getState();
+          if (!isAIConnectionReady(c)) useEditorWorkspaceStore.getState().setAIConnectionOpen(true);
+          else useUIStore.getState().setPanelVisible("agentChat", !useUIStore.getState().panels.agentChat?.visible);
+        }}
         onExport={() => { if (exportState.isExporting) handleCancelExport(); else { if (exportState.error) resetError(); openExportDialog(); } }}
         exportLabel={exportState.isExporting ? `${Math.round(exportState.progress)}%` : exportState.error ? "Retry" : exportState.complete ? "Saved" : "Export"}
         exportDisabled={exportState.complete}
@@ -310,6 +317,11 @@ export const Toolbar: React.FC = () => {
         <WorkspaceSaveStatus />
       </div>
       <div className="workspace-actions">
+        <div role="group" aria-label="Editing mode" className="workspace-mode">
+          <ShadcnButton variant="ghost" aria-pressed={!aiMode} onClick={() => useUIStore.getState().setPanelVisible("agentChat", false)}>Manual</ShadcnButton>
+          <ShadcnButton variant="ghost" aria-pressed={aiMode} onClick={() => { const c = useAIConnectionStore.getState(); if (!isAIConnectionReady(c)) useEditorWorkspaceStore.getState().setAIConnectionOpen(true); else useUIStore.getState().setPanelVisible("agentChat", true); }}><EditorHeaderIcon kind="ai" /> Assistente</ShadcnButton>
+          <ShadcnButton variant="ghost" title="Cofre de API Keys (Gemini, Groq, ElevenLabs, Kie.ai, Freepik...)" aria-label="Cadastrar APIs" onClick={() => useSettingsStore.getState().openSettings("api-keys")}>APIs</ShadcnButton>
+        </div>
         <div className="workspace-history">
           <ShadcnButton variant="ghost" size="icon" aria-label="Undo" onClick={() => void useProjectStore.getState().undo()}><EditorHeaderIcon kind="undo" /></ShadcnButton>
           <ShadcnButton variant="ghost" size="icon" aria-label="Redo" onClick={() => void useProjectStore.getState().redo()}><EditorHeaderIcon kind="redo" /></ShadcnButton>

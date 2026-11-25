@@ -17,7 +17,7 @@ import { formatMediaFileSize, getMediaFileSize, getMediaLibrarySizeLabel } from 
 import {
   Image as ImageIcon, Film, Music, Plus, Upload, Trash2,
   AlertTriangle,
-  RefreshCw,
+  RefreshCw, Sparkles,
 } from "@/icons/lucide-compat";
 import {
   BACKGROUND_PRESETS,
@@ -296,6 +296,7 @@ const MediaThumbnail: React.FC<{
   onAddToTimeline: () => void;
   /** Double-click / Enter: load the item in the Source monitor. */
   onOpenInSource: () => void;
+  onKieAI?: () => void;
   onRetryKieAI?: () => void;
 }> = ({
   item,
@@ -308,6 +309,7 @@ const MediaThumbnail: React.FC<{
   onDragStart,
   onAddToTimeline,
   onOpenInSource,
+  onKieAI,
   onRetryKieAI,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
@@ -453,6 +455,14 @@ const MediaThumbnail: React.FC<{
               </>
             ) : (
               <>
+                {item.type === "image" && onKieAI && (
+                  <PanelIconButton
+                    label="Create with KieAI"
+                    icon={<Sparkles size={12} className="text-primary" />}
+                    onClick={(e) => { e.stopPropagation(); onKieAI(); }}
+                    className="p-1 bg-primary/20 rounded hover:bg-primary/40 transition-colors"
+                  />
+                )}
                 <PanelIconButton
                   label="Add to timeline"
                   icon={<Plus size={12} className="text-primary" />}
@@ -638,6 +648,9 @@ const MediaThumbnail: React.FC<{
             <>
               <DropdownMenuItem onSelect={onOpenInSource}><Plus size={14} />Open in Source monitor</DropdownMenuItem>
               <DropdownMenuItem onSelect={onAddToTimeline}><Plus size={14} />Add to timeline</DropdownMenuItem>
+              {item.type === "image" && onKieAI && (
+                <DropdownMenuItem onSelect={onKieAI}><Sparkles size={14} />Create with KieAI</DropdownMenuItem>
+              )}
             </>
           )}
           {item.metadata.stockSource && <DropdownMenuItem onSelect={copyCredits}>Copy credits</DropdownMenuItem>}
@@ -713,6 +726,7 @@ const MediaThumbnailRow = React.memo(function MediaThumbnailRow({
       onDragStart={(e) => handlers.dragStart(e, item)}
       onAddToTimeline={() => handlers.addToTimeline(item)}
       onOpenInSource={() => handlers.openInSource(item.id)}
+      onKieAI={item.type === "image" && !item.isPending && !item.kieaiError ? () => handlers.kieAI(item) : undefined}
       onRetryKieAI={item.kieaiError && item.kieaiTaskId ? () => handlers.retryKieAI(item) : undefined}
     />
   );

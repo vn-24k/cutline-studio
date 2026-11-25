@@ -60,13 +60,23 @@ const providers = [
   },
   {
     id: "google",
-    name: "Google",
-    subtitle: "Gemini models",
+    name: "Google Gemini",
+    subtitle: "Grátis no AI Studio",
     monogram: "G",
     color: "#5B8DEF",
     provider: "compatible",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    model: "",
+    model: "gemini-4-hydrogen",
+  },
+  {
+    id: "groq",
+    name: "Groq",
+    subtitle: "Rápido (Llama 3.3 70B)",
+    monogram: "Q",
+    color: "#F97316",
+    provider: "compatible",
+    baseUrl: "https://api.groq.com/openai/v1",
+    model: "llama-3.3-70b-versatile",
   },
   {
     id: "openrouter",
@@ -315,6 +325,21 @@ function ConnectionForm({ onClose }: { onClose: () => void }) {
                   onClick={() => { update({ model: AI_PROVIDER_DEFAULTS[draft.provider].model }); setModelOpen(false); }}>
                   {aiModelLabel(draft.provider, AI_PROVIDER_DEFAULTS[draft.provider].model)}
                 </Button>}
+                {selected === "google" && (
+                  <>
+                    <Button variant="ghost" className="w-full justify-start" onClick={() => { update({ model: "gemini-4-hydrogen" }); setModelOpen(false); }}>
+                      Gemini 4 Hydrogen (Grátis)
+                    </Button>
+                    <Button variant="ghost" className="w-full justify-start" onClick={() => { update({ model: "gemini-2.5-flash" }); setModelOpen(false); }}>
+                      Gemini 2.5 Flash
+                    </Button>
+                  </>
+                )}
+                {selected === "groq" && (
+                  <Button variant="ghost" className="w-full justify-start" onClick={() => { update({ model: "llama-3.3-70b-versatile" }); setModelOpen(false); }}>
+                    Llama 3.3 70B Versatile
+                  </Button>
+                )}
                 <label>Model ID<Input aria-label="AI model ID" value={draft.model} onChange={e => update({ model: e.target.value })}
                   placeholder="Tool-capable model ID" spellCheck={false} onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); setModelOpen(false); } }} /></label>
                 <Button variant="secondary" onClick={() => setModelOpen(false)}>Done</Button>
@@ -378,9 +403,20 @@ function ConnectionForm({ onClose }: { onClose: () => void }) {
       </div>
       </ScrollArea>
       <footer>
-        <Button variant="link" onClick={() => setPrivacy(!privacy)}>
-          What gets sent to the provider?
-        </Button>
+        <div className="flex items-center gap-3">
+          <Button variant="link" onClick={() => setPrivacy(!privacy)}>
+            What gets sent to the provider?
+          </Button>
+          <Button
+            variant="link"
+            onClick={() => {
+              onClose();
+              useSettingsStore.getState().openSettings("api-keys");
+            }}
+          >
+            Cofre de API Keys
+          </Button>
+        </div>
         <div className="flex gap-2">
           <Button variant="secondary" onClick={onClose}>
             Cancel
